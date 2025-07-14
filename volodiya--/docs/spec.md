@@ -50,21 +50,21 @@ Example:
 Expr ::= Term { ("+" | "-") Term }
 
 ### 4.2 Syntactic Grammar (EBNF)
-Program      ::= { Item } ;
-Item         ::= Function | Struct ;
-Function     ::= "fn" Type | "voloid" IDENT "(" [ Param+ ] ")" Block ;
+Program      ::= { Function | Struct } ;
+Struct       ::= "struct" IDENT "{" { StructField } "}" ;
+StructField  ::= IDENT ":" Type ";" ;
+Function     ::= "fn" ( "voloid" | Type ) IDENT "(" [ Param { "," Param } ] ")" Block ;
 Param        ::= IDENT ":" Type ;
 Block        ::= "{" { Stmt } "}" ;
-Stmt         ::= DeclStmt | IfStmt | WhileStmt | ReturnStmt | ForStmt | ExprStmt | BreakStmt | AssignStmt | Block | ";" ;
+Stmt         ::= DeclStmt | AssignStmt | IfStmt | WhileStmt | ForStmt | ReturnStmt | BreakStmt | ExprStmt | Block | ";" ;
 DeclStmt     ::= [ "const" ] Type IDENT [ "=" Expr ] ";" ;
 Type         ::= PrimaryType { PostfixArray } ;
 PrimaryType  ::= BUILTIN_TYPE | IDENT ;
-PostArray    ::= "[" ConstExpr "]" ;
-IfStmt       ::= "if" "(" Expr ")" Block [ "else" ElseStmt ] ;
-ElseStmt     ::= Block | IfStmt ;
+PostfixArray ::= "[" Expr "]" ;
+IfStmt       ::= "if" "(" Expr ")" Stmt [ "else" Stmt ] ;
 WhileStmt    ::= "while" "(" Expr ")" Stmt ;
 ReturnStmt   ::= "return" [ Expr ] ;
-ForStmt      ::= "for" "(" [ ForInit ] ";" [ Expr ] ";" [ ForStep ] ")" Stmt ;
+ForStmt      ::= "for" "(" [ ForInit ] ";" [ Expr ] ";" [ Expr ] ")" Stmt ;
 ForInit      ::= Init { "," init } ;
 init         ::= Decl | AssignExpr ;
 Decl         ::= [ "const" ] Type IDENT [ "=" Expr ] ;
@@ -72,34 +72,33 @@ AssignExpr   ::= IDENT [ "=" Expr ] ;
 BreakStmt    ::= "break" ";" ;
 AssignStmt   ::= IDENT [ "=" Expr ] ";" ;
 ExprStmt     ::= Expr ";" ;
-Expr         ::= ExprLogicOr |  ;
-ExprUniry    ::= [ "-" | "+" | "!" ]  ExprPostfix
+Expr         ::= ExprLogicOr ;
+ExprLogicOr  ::= ExprLogicAnd { || ExprLogicAnd } ;
+ExprLogicAnd ::= ExprCom { "&&" ExprCom } ;
+ExprCom      ::= ExprAdd { ( "<" | "<=" | ">" | ">=" | "!=" | "==" ) ExprAdd } ;
+ExprAdd      ::= ExprMul { ( "+" | "-" ) ExprMul } ; 
+ExprMul      ::= ExprUnary { ( "*" | "/" | "%" ) ExprUnary } ;
+ExprUniry    ::= ( "-" | "+" | "!" ) ExprUniry | ExprPostfix ;
 ExprPostfix  ::= ExprPrimary { PostfixOp } ;
-PostfixOp   ::= "[" Expr "]" | "(" [ ArgumentList ] ")" | "." IDENT ;
+PostfixOp    ::= "[" Expr "]" | "(" [ ArgumentList ] ")" | "." IDENT ;
 ArgumentList ::= Expr { "," Expr } ;
 ExprPrimary  ::= IDENT | INT_LIT | STRING_LIT | BOOL_LIT | ARRAY_LIT ;
-
-
-
-
-
-
 BUILTIN_TYPE ::= "i32" | "i64" | "u32" | "u64" | "bool" | "string" ;
 INT_LIT      ::= DEC_LIT | HEX_LIT | BIN_LIT | OCT_LIT ;
-DecLit      ::= DigitNoZero { Digit | "_" } ;
-HexLit      ::= "0" [ "x" | "X" ] HexDigit { HexDigit | "_" } ;
-BinLit      ::= "0" [ "b" | "B" ] ( "0" | "1" ) { "0" | "1" | "_" } ;
-OctLit      ::= "0" [ "o" | "O" ] OctDigit { OctDigit | "_" } ;
-HexDigit    ::= Digit | "a" | "b" | "c" | "d" | "e" | "f" | "A" | "B" | "C" | "D" | "E" | "F" ;
-DecDigit    ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
-OctDigit    ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" ;
-DigitNoZero ::= "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
-IDENT       ::= Letter { Letter | DecDigit | "_" } ;
-Letter      ::= "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" | "l" | "m"
-            | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y" | "z"
-            | "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" | "K" | "L" | "M"
-            | "N" | "O" | "P" | "Q" | "R" | "S" | "T" | "U" | "V" | "W" | "X" | "Y" | "Z" ;
-STRING_LIT  ::= """ { any_unicode | EscapeSeq } """ ;
-ESCAPE_SEQ  ::= "\\" | "\"" | "\n" | "\t" | "\r" ;
-BOOL_LIT    ::= "true" | "false" ;
-ARRAY_LIT   ::= "[" [ ArgumentList ] "]" ;
+DecLit       ::= DigitNoZero { Digit | "_" } ;
+HexLit       ::= "0" [ "x" | "X" ] HexDigit { HexDigit | "_" } ;
+BinLit       ::= "0" [ "b" | "B" ] ( "0" | "1" ) { "0" | "1" | "_" } ;
+OctLit       ::= "0" [ "o" | "O" ] OctDigit { OctDigit | "_" } ;
+HexDigit     ::= Digit | "a" | "b" | "c" | "d" | "e" | "f" | "A" | "B" | "C" | "D" | "E" | "F" ;
+DecDigit     ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
+OctDigit     ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" ;
+DigitNoZero  ::= "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
+IDENT        ::= Letter { Letter | DecDigit | "_" } ;
+Letter       ::= "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" | "l" | "m"
+             | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y" | "z"
+             | "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" | "K" | "L" | "M"
+             | "N" | "O" | "P" | "Q" | "R" | "S" | "T" | "U" | "V" | "W" | "X" | "Y" | "Z" ;
+STRING_LIT   ::= """ { any_unicode | EscapeSeq } """ ;
+ESCAPE_SEQ   ::= "\\" | "\"" | "\n" | "\t" | "\r" ;
+BOOL_LIT     ::= "true" | "false" ;
+ARRAY_LIT    ::= "[" [ ArgumentList ] "]" ;
