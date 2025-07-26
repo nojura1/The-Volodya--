@@ -1,4 +1,6 @@
-#include <stdio.h>
+#include "lexer.h"
+
 int main() {
-    puts("Hello, Volodiya--!");
+    lexer_all("../tests/test.vol");
+    return 0;
 }
