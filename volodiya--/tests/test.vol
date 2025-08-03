@@ -1,16 +1,1 @@
-fn i32 add(a:i32, b:i32) {
-   return a + b;
-}
-
-fn i32 main() {
-   i32 b = 40;
-   i32 a = 2;
-
-   if (add(a, b) == 42) {
-      print("Life, universe & everything"); //volodiya will never see this comment
-   }
-}
-
-/* and
-   this
-   one  */
+-(123)a

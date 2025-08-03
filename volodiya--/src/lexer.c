@@ -511,17 +511,17 @@ TokenVec lexer_all(const char *path) {
     TokenVec vec; 
     tokenvec_init(&vec);
 
-    for (;;) {
+    for (int i = 0;;i++) {
         Token tok = lexer_next(&lexer);
         tokenvec_push(&vec, tok);
 
         printf("type:%20s  start:%30.*s  line:%5zu  column:%5zu\n",
-               token_type_name(tok.type), (int)tok.length, tok.start_pos,
+               token_type_name(vec.data[i].type), (int)vec.data[i].length, vec.data[i].start_pos,
                tok.line, tok.column);
 
         if (tok.type == TOK_EOF) break;
     }
 
-    if (lexer.had_error) dump_lex_errors(&lexer); exit(1);
+    if (lexer.had_error) { dump_lex_errors(&lexer); exit(1); }
     return vec;
 }

@@ -1,17 +1,17 @@
 # Specification for the Volodya-- programming language
 
 ## 1. Introduction
-The Volodya-- programming language is an imperative and procedural (possibly object-oriented?) C-like programming language oriented toward (systems programming?). It is designed to be simple enough, but encourages disciplined programming. The main purpose is to explore the behavior of programming languages more deeply and fully understand all the nuances of compiler building. The secondary purpose is to write a small (program?) using it. The Volodya-- programming language was inspired by C (but organized rather differently?).
+The Volodya-- programming language is an imperative and procedural (possibly object-oriented?) C-like programming language oriented toward (systems programming?). It is designed to be simple enough, but encourages disciplined programming. The main purpose is to explore the behavior of programming languages more deeply and fully understand all the nuances of compiler building. The secondary purpose is to write a small program using it. The Volodya-- programming language was inspired by C (but organized rather differently?).
 
 The Volodya-- programming language is statically, strongly, nominally, and explicitly typed. Casting has to be explicit both ways. Compilation consists of translating source code into assembly. (Polymorphism?)
 
-The Volodya-- programming language is a relatively low-level language. It includes manual memory management with a del command.
+The Volodya-- programming language is a relatively low-level language. It includes manual memory management with a free and malloc commands.
 
 ## 2. Lexical structure
 | Categories     | Examples                                                                            
 |----------------|-------------------------------------------------------------------------------------------
 | Keywords       | `fn`, `if`, `else`, `while`, `return`, `struct`, `i32`, `i64`, `u32`, `u64`, `bool`, `string`, `break`, `const`, `for`,  `voloid` (`continue`, `b32`, `b64`, `char`, `switch`, `case`, `free`, `malloc`)
-| Operators      | `+ - * / %`, `&& || !`, `== != < > <= >=`, `=` (`| & ~ ^`)
+| Operators      | `+ - * / %`, `&& \|\| !`, `== != < > <= >=`, `=` (`\| & ~ ^`)
 | Separators     | `(` `)` `{` `}` `[` `]` `,` `.` `:` `;`
 | Literals       | integers `123`, booleans `true/false`, strings `"text"`, escape sequences `\"` (characters `'a'`, floating point numbers `1.23`)
 | Identifiers    | `[A-Za-z][A-Za-z0-9_]*`
@@ -53,61 +53,59 @@ StructField  ::= IDENT ":" Type ";" ;
 Function     ::= "fn" ( "voloid" | Type ) IDENT "(" [ Param { "," Param } ] ")" Block ;
 Param        ::= IDENT ":" Type ;
 Block        ::= "{" { Stmt } "}" ;
-Stmt         ::= DeclStmt 
-               | AssignStmt 
-               | IfStmt 
-               | WhileStmt 
-               | ForStmt 
-               | ReturnStmt 
-               | BreakStmt 
-               | ExprStmt 
-               | Block 
-               | ";" ;
-DeclStmt     ::= [ "const" ] Type IDENT [ "=" Expr ] ";" ;
-Type         ::= PrimaryType { PostfixArray } ;
+Stmt         ::= DeclStmt | IfStmt | WhileStmt | ForStmt 
+               | ReturnStmt | BreakStmt | ExprStmt | Block | ";" ;
+DeclStmt     ::= DeclExpr ";" ;
+Type         ::= PrimaryType { PostfixArray };
 PrimaryType  ::= BUILTIN_TYPE | IDENT ;
 PostfixArray ::= "[" Expr "]" ;
 IfStmt       ::= "if" "(" Expr ")" Stmt [ "else" Stmt ] ;
 WhileStmt    ::= "while" "(" Expr ")" Stmt ;
-ReturnStmt   ::= "return" [ Expr ] ;
-ForStmt      ::= "for" "(" [ ForInit ] ";" [ Expr ] ";" [ Expr ] ")" Stmt ;
+ReturnStmt   ::= "return" [ Expr ] ";" ;
+ForStmt      ::= "for" "(" [ ForInit ] ";" [ Expr ] ";" [ Step ] ")" Stmt ;
 ForInit      ::= Init { "," Init } ;
-Init         ::= Decl | AssignExpr ;
-Decl         ::= [ "const" ] Type IDENT [ "=" Expr ] ;
-AssignExpr   ::= IDENT [ "=" Expr ] ;
+Init         ::= DeclExpr | AssignExpr ;
+DeclExpr     ::= [ "const" ] Type IDENT [ "=" Expr ] ;
+AssignExpr   ::= LValue "=" Expr;
+LValue       ::= IDENT { "[" Expr "]" | "." IDENT } ;
+Step         ::= StepItem { "," StepItem } ;
+StepItem     ::= AssignExpr | Expr ;
 BreakStmt    ::= "break" ";" ;
-AssignStmt   ::= IDENT [ "=" Expr ] ";" ;
 ExprStmt     ::= Expr ";" ;
 Expr         ::= ExprLogicOr ;
-ExprLogicOr  ::= ExprLogicAnd { || ExprLogicAnd } ;
-ExprLogicAnd ::= ExprCom { "&&" ExprCom } ;
-ExprCom      ::= ExprAdd { ( "<" | "<=" | ">" | ">=" | "!=" | "==" ) ExprAdd } ;
+ExprLogicOr  ::= ExprLogicAnd { "||" ExprLogicAnd } ;
+ExprLogicAnd ::= ExprEq { "&&" ExprEq } ;
+ExprEq       ::= ExprRel { ("==" | "!=") ExprRel } ;
+ExprRel      ::= ExprAdd { ("<" | "<=" | ">" | ">=") ExprAdd } ;
 ExprAdd      ::= ExprMul { ( "+" | "-" ) ExprMul } ; 
-ExprMul      ::= ExprUnary { ( "*" | "/" | "%" ) ExprUnary } ;
-ExprUniry    ::= ( "-" | "+" | "!" ) ExprUniry | ExprPostfix ;
+ExprMul      ::= ExprCast { ( "*" | "/" | "%" ) ExprCast } ;
+ExprCast     ::= [ "(" CastType ")" ] ExprUnary ;
+CastType     ::= BUILTIN_TYPE { ArraySuffix } | IDENT { "." IDENT } { ArraySuffix } ;
+ArraySuffix  ::= "[" "]" ;
+ExprUnary    ::= ( "-" | "+" | "!" ) ExprUnary | ExprPostfix ;
 ExprPostfix  ::= ExprPrimary { PostfixOp } ;
-PostfixOp    ::= "[" Expr "]" | "(" [ ArgumentList ] ")" | "." IDENT ;
-ArgumentList ::= Expr { "," Expr } ;
-ExprPrimary  ::= IDENT | INT_LIT | STRING_LIT | BOOL_LIT | ARRAY_LIT ;
+PostfixOp    ::= "[" Expr "]" | "(" [ List ] ")" | "." IDENT ;
+List         ::= Expr { "," Expr } ;
+ExprPrimary  ::= IDENT | IntLit | STRING_LIT | BOOL_LIT | ARRAY_LIT | "(" Expr ")" ;
 BUILTIN_TYPE ::= "i32" | "i64" | "u32" | "u64" | "bool" | "string" ;
-IntLit       ::= DEС_LIT | HEX_LIT | BIN_LIT | OCT_LIT ;
-DEС_LIT      ::= DigitNoZero { Digit | "_" } | "0" ;
+IntLit       ::= DEC_LIT | HEX_LIT | BIN_LIT | OCT_LIT ;
+DEC_LIT      ::= DigitNoZero { DecDigit | "_" } | "0" ;
 HEX_LIT      ::= "0" ( "x" | "X" ) HexDigit { HexDigit | "_" } ;
 BIN_LIT      ::= "0" ( "b" | "B" ) ( "0" | "1" ) { "0" | "1" | "_" } ;
 OCT_LIT      ::= "0" ( "o" | "O" ) OctDigit { OctDigit | "_" } ;
-HexDigit     ::= Digit | "a" | "b" | "c" | "d" | "e" | "f" | "A" | "B" | "C" | "D" | "E" | "F" ;
+HexDigit     ::= DecDigit | "a" | "b" | "c" | "d" | "e" | "f" | "A" | "B" | "C" | "D" | "E" | "F" ;
 DecDigit     ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
 OctDigit     ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" ;
 DigitNoZero  ::= "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
 IDENT        ::= Letter { Letter | DecDigit | "_" } ;
 Letter       ::= "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" | "l" | "m"
-             | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y" | "z"
-             | "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" | "K" | "L" | "M"
-             | "N" | "O" | "P" | "Q" | "R" | "S" | "T" | "U" | "V" | "W" | "X" | "Y" | "Z" ;
+               | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y" | "z"
+               | "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" | "K" | "L" | "M"
+               | "N" | "O" | "P" | "Q" | "R" | "S" | "T" | "U" | "V" | "W" | "X" | "Y" | "Z" ;
 STRING_LIT   ::= """ { any_unicode | EscapeSeq } """ ;
 EscapeSeq    ::= "\\" | "\"" | "\n" | "\t" | "\r" ;
 BOOL_LIT     ::= "true" | "false" ;
-ARRAY_LIT    ::= "[" [ ArgumentList ] "]" ;
+ARRAY_LIT    ::= "[" [ List ] "]" ;
 ```
 
 ## 6. Examples
@@ -144,7 +142,7 @@ const bool FLAG2 = false;
 Every numeric literal form and type (binary, octal, decimal with underscores, hexadecimal) plus true/false boolean literal.
 ### 5. control.vol
 ```Volodya--
-fn i64 add(i32 a, i64 b) {
+fn i64 add(a:i32, b:i64) {
     return (i64)a + b;   // explicit cast from i32 → i64
 }
 
@@ -158,12 +156,12 @@ fn voloid loop_demo() {
 
     //   init:   i = 10 , j = 10
     //   cond:   k < l
-    //   update: k *= 2 , l = add(i, j)
+    //   update: k *= 2 , l = l + add(i, j)
 
     for (i32 i = 10, i64 j = 10;
-         i32 k = 1,   i64 l = 50;
-         k < l;
-         k = k * 2,   l = add(i, j))
+         i32 k = 1,  i64 l = 50;
+         (i64)k < l;
+         k = k * 2,   l = l + add(i, j))
     {
         print("inside for");
     }
@@ -171,9 +169,9 @@ fn voloid loop_demo() {
 ```
 Demonstrates advanced control flow:
 
-a while loop with an if + break, mutable variable updates;
-explicit integer type cast (i64)a;
-a multi‑clause for loop that includes multiple initialisers of different types, a compound condition, and two update expressions (k *= 2, l = add(i, j));
+a while loop with an if + break, mutable variable updates;  
+explicit integer type cast (i64)a;  
+a for loop that includes multiple initialisers of different types, a compound condition, and two update expressions (k = k * 2, l = l + add(i, j));  
 use of the custom voloid return type and a function call with mixed‐size integers.
 ### 6. voloid.vol
 ```Volodya--
@@ -202,8 +200,8 @@ Both comment styles (//, /* … */). Lexer discards them entirely.
 ```Volodya--
 struct Vec3 {
     x:i32;
-    x:i32;
-    x:i32;
+    y:i32;
+    z:i32;
 }
 
 fn i32 dot(a:Vec3, b:Vec3) {

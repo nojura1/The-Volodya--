@@ -1,6 +1,7 @@
 #include "lexer.h"
+#include "parser.c"
 
 int main() {
-    lexer_all("../tests/test.vol");
+    parse(lexer_all("../tests/test.vol"));
     return 0;
 }

@@ -8,7 +8,7 @@ void  lexer_init(Lexer *const lex, const char *s, size_t len);
 
 Token lexer_next(Lexer *const lexer);
 
-TokenVec  lexer_all(const char *path);
+TokenVec lexer_all(const char *path);
 
 void dump_lex_errors(const Lexer *const lex);
 
