@@ -50,12 +50,13 @@ Example: Expr ::= Term { ("+" | "-") Term }
 Program      ::= { Function | Struct } ;
 Struct       ::= "struct" IDENT "{" { StructField } "}" ;
 StructField  ::= IDENT ":" Type ";" ;
-Function     ::= "fn" ( "voloid" | Type ) IDENT "(" [ Param { "," Param } ] ")" Block ;
-Param        ::= IDENT ":" Type ;
+Function     ::= "fn" ( "voloid" | PrimaryType { "[" "]" } ) IDENT "(" [ Param { "," Param } ] ")" Block ;
+Param        ::= IDENT ":" PrimaryType { "[" "]" } ;
 Block        ::= "{" { Stmt } "}" ;
-Stmt         ::= DeclStmt | IfStmt | WhileStmt | ForStmt 
+Stmt         ::= DeclStmt | IfStmt | WhileStmt | ForStmt | AssignStmt
                | ReturnStmt | BreakStmt | ExprStmt | Block | ";" ;
 DeclStmt     ::= DeclExpr ";" ;
+AssignStmt   ::= AssignExpr ";" ;
 Type         ::= PrimaryType { PostfixArray };
 PrimaryType  ::= BUILTIN_TYPE | IDENT ;
 PostfixArray ::= "[" Expr "]" ;
@@ -63,12 +64,12 @@ IfStmt       ::= "if" "(" Expr ")" Stmt [ "else" Stmt ] ;
 WhileStmt    ::= "while" "(" Expr ")" Stmt ;
 ReturnStmt   ::= "return" [ Expr ] ";" ;
 ForStmt      ::= "for" "(" [ ForInit ] ";" [ Expr ] ";" [ Step ] ")" Stmt ;
+Step         ::= StepItem { "," StepItem } ;
 ForInit      ::= Init { "," Init } ;
 Init         ::= DeclExpr | AssignExpr ;
 DeclExpr     ::= [ "const" ] Type IDENT [ "=" Expr ] ;
-AssignExpr   ::= LValue "=" Expr;
+AssignExpr   ::= LValue "=" Expr ;
 LValue       ::= IDENT { "[" Expr "]" | "." IDENT } ;
-Step         ::= StepItem { "," StepItem } ;
 StepItem     ::= AssignExpr | Expr ;
 BreakStmt    ::= "break" ";" ;
 ExprStmt     ::= Expr ";" ;
@@ -80,13 +81,14 @@ ExprRel      ::= ExprAdd { ("<" | "<=" | ">" | ">=") ExprAdd } ;
 ExprAdd      ::= ExprMul { ( "+" | "-" ) ExprMul } ; 
 ExprMul      ::= ExprCast { ( "*" | "/" | "%" ) ExprCast } ;
 ExprCast     ::= [ "(" CastType ")" ] ExprUnary ;
-CastType     ::= BUILTIN_TYPE { ArraySuffix } | IDENT { "." IDENT } { ArraySuffix } ;
+CastType     ::= ( BUILTIN_TYPE | IDENT ) { ArraySuffix } ;
 ArraySuffix  ::= "[" "]" ;
 ExprUnary    ::= ( "-" | "+" | "!" ) ExprUnary | ExprPostfix ;
 ExprPostfix  ::= ExprPrimary { PostfixOp } ;
 PostfixOp    ::= "[" Expr "]" | "(" [ List ] ")" | "." IDENT ;
 List         ::= Expr { "," Expr } ;
-ExprPrimary  ::= IDENT | IntLit | STRING_LIT | BOOL_LIT | ARRAY_LIT | "(" Expr ")" ;
+ExprPrimary  ::= IDENT | IntLit | STRING_LIT | BOOL_LIT | ArrayLit | "(" Expr ")" ;
+ArrayLit     ::= "[" [ List ] "]" ;
 BUILTIN_TYPE ::= "i32" | "i64" | "u32" | "u64" | "bool" | "string" ;
 IntLit       ::= DEC_LIT | HEX_LIT | BIN_LIT | OCT_LIT ;
 DEC_LIT      ::= DigitNoZero { DecDigit | "_" } | "0" ;
@@ -105,7 +107,6 @@ Letter       ::= "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k"
 STRING_LIT   ::= """ { any_unicode | EscapeSeq } """ ;
 EscapeSeq    ::= "\\" | "\"" | "\n" | "\t" | "\r" ;
 BOOL_LIT     ::= "true" | "false" ;
-ARRAY_LIT    ::= "[" [ List ] "]" ;
 ```
 
 ## 6. Examples
@@ -211,15 +212,15 @@ fn i32 dot(a:Vec3, b:Vec3) {
 Introduces the struct keyword, field access with the dot operator, and passing user‑defined types by value.
 ### 10. kitchen_sink.vol
 ```Volodya--
-/* Every feature in one go */
-const u64 HEX = 0xDEAD_BEEF;
-const u32 BIN = 0b1010_1010;
-const bool FLAG = false;
-
 struct Pair { a:i32; b:i32; }
 
 fn voloid main() {
-    Pair p = { .a = 1, .b = 2 };
+    const u64 HEX = 0xDEAD_BEEF;
+    const u32 BIN = 0b1010_1010;
+    const bool FLAG = false;
+    Pair p;
+    p.a = 2;
+    p.b = 1;
     i32 sum = p.a + p.b;
 
     for (i32 i = 0; i < 5; i = i + 1) {
