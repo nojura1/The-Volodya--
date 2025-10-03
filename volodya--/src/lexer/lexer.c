@@ -3,9 +3,10 @@
 #include <errno.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdint.h>
 #include "lexer.h"
-#include "TokenVec.h"
-#include "TokenNames.h"
+#include "../Token/TokenVec.h"
+#include "../Token/TokenNames.h"
 
 typedef struct {
     size_t line;
@@ -20,14 +21,11 @@ typedef struct {
 
 typedef struct Lexer {
     const char *src;
-    size_t length;
-    size_t pos;
-    size_t line;
-    size_t column;
+    size_t length, pos;
+    size_t line, column;
     LexError *errors;
-    size_t err_count;
-    size_t err_cap;
-    int had_error;
+    size_t err_count, err_cap;
+    bool had_error;
 } Lexer;
 
 static const Keyword keywords[] = {
@@ -80,7 +78,7 @@ char *read_file_or_exit(const char *path, size_t *len_out) {
     char *p = read_file(path, len_out);
     if (!p) {
         fprintf(stderr, "fatal: cannot read %s: %s\n", path, strerror(errno));
-        exit(1);
+        exit(EXIT_FAILURE);
     }
     return p;
 }
@@ -120,14 +118,14 @@ static inline Token make_token(TokenType type, const char *start, size_t l, size
 }
 
 void lex_error(Lexer *const lexer, const char *msg) {
-    lexer->had_error = 1;
+    lexer->had_error = true;
 
     if (lexer->err_cap == lexer->err_count) {
         lexer->err_cap = lexer->err_cap ? lexer->err_cap * 2 : 8;
         lexer->errors = realloc(lexer->errors, sizeof(LexError) * lexer->err_cap);
         if (!lexer->errors) {
             fprintf(stderr, "realloc\n");
-            exit(1);
+            exit(EXIT_FAILURE);
         }
     }
     
@@ -137,8 +135,8 @@ void lex_error(Lexer *const lexer, const char *msg) {
     lexer->errors[t].column = lexer->column;
 }
 
-void skip_ignorable(Lexer *const lexer) {
-    while (1) {
+static void skip_ignorable(Lexer *const lexer) {
+    for (;;) {
         char c = peek(lexer);
         char c1 = peek_next(lexer);
         
@@ -165,7 +163,7 @@ TokenType keyword_lookup(const char *lex, const size_t len) {
     return TOK_IDENT;
 }
 
-Token scan_identifier(Lexer *const lexer) {
+static Token scan_identifier(Lexer *const lexer) {
     const char *start_pos = lexer->src + lexer->pos;
     size_t line_start = lexer->line;
     size_t column_start = lexer->column;
@@ -178,20 +176,20 @@ Token scan_identifier(Lexer *const lexer) {
     return make_token(keyword_lookup(start_pos, l), start_pos, l, line_start, column_start);
 }
 
-Token scan_hex(Lexer *const lexer) {
+static Token scan_with_prefix(Lexer *const lexer, int (*fun)(int), TokenType tt) {
     advance(lexer);
     advance(lexer);
 
     const char *start_pos = lexer->src + lexer->pos;
     size_t line_start = lexer->line;
     size_t column_start = lexer->column;
-    char c = peek(lexer);
+    char c = advance(lexer);
 
-    if (!isxdigit((unsigned char) c)) lex_error(lexer, "expected hexadecimal digit after '0x'/'0X'");
-    else if (c == '_') lex_error(lexer, "underscore cannot appear at the beginning of a hexadecimal literal");
+    if (c == '_') lex_error(lexer, "underscore cannot appear at the beginning of a numeric literal");
+    else if (!fun((unsigned char) c)) lex_error(lexer, "expected digit after prefix");
 
-    if (isxdigit((unsigned char) c)) {
-        for (; isxdigit((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer));
+    if (fun((unsigned char) peek(lexer))) {
+        for (; fun((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer));
     }
 
     c = peek(lexer);
@@ -202,72 +200,14 @@ Token scan_hex(Lexer *const lexer) {
     }
 
     size_t l = lexer->src + lexer->pos - start_pos;
-    return make_token(TOK_HEX_LIT, start_pos, l, line_start, column_start);
+    return make_token(tt, start_pos, l, line_start, column_start);
 }
 
-Token scan_bin(Lexer *const lexer) {
-    advance(lexer);
-    advance(lexer);
+static inline int is_oct(int n) { return n >= '0' && n <= '7'; }
+static inline int is_bin(int n) { return n == '0' || n == '1'; }
+static inline int no_zero(int n) { return n >= '1' && n <= '9'; }
 
-    const char *start_pos = lexer->src + lexer->pos;
-    size_t line_start = lexer->line;
-    size_t column_start = lexer->column;
-    char c = peek(lexer);
-
-    if (c == '_') lex_error(lexer, "underscore cannot appear at the beginning of a binary literal");
-    else if (c != '0' && c != '1') lex_error(lexer, "expected binary digit after '0b'/'0B'");
-
-    if (c == '0' || c == '1') {
-        for (; peek(lexer) == '0' || peek(lexer) == '1' || peek(lexer) == '_'; advance(lexer));
-    }
-
-    c = peek(lexer);
-
-    if (isalnum((unsigned char) c) || c == '_') {
-        lex_error(lexer, "invalid numeric literal: unexpected characters");
-        for (; isalnum((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer));
-    }
-
-    size_t l = lexer->src + lexer->pos - start_pos;
-    return make_token(TOK_BIN_LIT, start_pos, l, line_start, column_start);
-}
-
-static inline int is_oct(char n) {
-    return n >= '0' && n <= '7';
-}
-
-Token scan_oct(Lexer *const lexer) {
-    advance(lexer);
-    advance(lexer);
-
-    const char *start_pos = lexer->src + lexer->pos;
-    size_t line_start = lexer->line;
-    size_t column_start = lexer->column;
-    char c = peek(lexer);
-
-    if (c == '_') lex_error(lexer, "underscore cannot appear at the beginning of a octal literal");
-    else if (!is_oct(c)) lex_error(lexer, "expected octal digit after '0o'/'0O'");
-
-    if (is_oct(c)) {
-        for (; is_oct(peek(lexer)) || peek(lexer) == '_'; advance(lexer));
-    }
-
-    c = peek(lexer);
-
-    if (isalnum((unsigned char) c) || c == '_') {
-        lex_error(lexer, "invalid numeric literal: unexpected characters");
-        for (; isalnum((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer));
-    }
-
-    size_t l = lexer->src + lexer->pos - start_pos;
-    return make_token(TOK_OCT_LIT, start_pos, l, line_start, column_start);
-}
-
-static inline int no_zero(char n) {
-    return n >= '1' && n <= '9';
-}
-
-Token scan_dec(Lexer *const lexer) {
+static Token scan_dec(Lexer *const lexer) {
     const char *start_pos = lexer->src + lexer->pos;
     size_t line_start = lexer->line;
     size_t column_start = lexer->column;
@@ -287,17 +227,20 @@ Token scan_dec(Lexer *const lexer) {
     return make_token(TOK_DEC_LIT, start_pos, l, line_start, column_start);
 }
 
-Token scan_number(Lexer *const lexer) {
+static Token scan_number(Lexer *const lexer) {
     char c = peek(lexer);
     char c1 = peek_next(lexer);
 
-    if ((c1 == 'x' || c1 == 'X') && c == '0') return scan_hex(lexer);
-    else if ((c1 == 'b' || c1 == 'B') && c == '0') return scan_bin(lexer);
-    else if ((c1 == 'o' || c1 == 'O') && c == '0') return scan_oct(lexer);
+    if ((c1 == 'x' || c1 == 'X') && c == '0') return scan_with_prefix(lexer, isxdigit, TOK_HEX_LIT);
+    else if ((c1 == 'b' || c1 == 'B') && c == '0') return scan_with_prefix(lexer, is_bin, TOK_BIN_LIT);
+    else if ((c1 == 'o' || c1 == 'O') && c == '0') return scan_with_prefix(lexer, is_oct, TOK_OCT_LIT);
     else return scan_dec(lexer);
 }
 
-Token scan_string(Lexer *const lexer) {
+static inline void advance_bytes_no_col(Lexer *const lexer, size_t n) { lexer->pos += n; }
+static inline void advance_bytes_col(Lexer *const lexer, size_t n) { lexer->pos += n; lexer->column++; }
+
+static Token scan_string(Lexer *lexer) {
     const char *start_pos = lexer->src + lexer->pos;
     size_t line_start = lexer->line;
     size_t column_start = lexer->column;
@@ -305,23 +248,25 @@ Token scan_string(Lexer *const lexer) {
     advance(lexer);
 
     while (1) {
-        char c = peek(lexer);
-        if (c == '\"') { advance(lexer); break; }
+        unsigned char c = peek(lexer);
+        
+        if ((c & 0xE0) == 0xC0) { advance_bytes_col(lexer, 2); continue; }
+        else if ((c & 0xF0) == 0xE0) { advance_bytes_col(lexer, 3); continue; }
+        else if ((c & 0xF8) == 0xF0) { advance_bytes_col(lexer, 4); continue; }
+        
+        if (c == '"') { advance(lexer); break; }
         
         if (c == '\\') {
-            advance(lexer); 
+            advance(lexer);
             switch (peek(lexer)) {
-                case 'n': case 't': case 'r':
-                case '\"': case '\\': case '0':
-                    break;
+                case 'n': case 't': case 'r': case '"': case '\\': case '0': break;
                 default: lex_error(lexer, "invalid escape sequence in string literal");
             }
         }
 
         c = peek(lexer);
 
-        if (c == '\n') { lex_error(lexer, "newline in string literal"); break; }
-        if (c == '\0') { lex_error(lexer, "unterminated string literal"); break; }
+        if (c == '\n' || c == '\0') { lex_error(lexer, "unterminated string literal"); break; }
         advance(lexer);
     }
     
@@ -333,7 +278,7 @@ void tokenvec_init(TokenVec *v) {
     v->data = malloc(128 * sizeof(Token));
     if (!v->data) {
         fprintf(stderr, "malloc\n");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
     v->cap = 128;
     v->count = 0;
@@ -345,7 +290,7 @@ void tokenvec_push(TokenVec *v, Token t) {
         v->data = realloc(v->data, v->cap * sizeof(Token));
         if (!v->data) {
             fprintf(stderr, "realloc\n");
-            exit(1);
+            exit(EXIT_FAILURE);
         }
     }
     v->data[v->count++] = t;
@@ -361,12 +306,12 @@ Token lexer_next(Lexer *const lexer) {
 
     if (isalpha((unsigned char) c)) return scan_identifier(lexer);
     else if (isdigit((unsigned char) c)) return scan_number(lexer);
-    else if (c == '\"') return scan_string(lexer);
+    else if (c == '"') return scan_string(lexer);
 
     const char *start_pos = lexer->src + lexer->pos;
     size_t line_start = lexer->line;
     size_t column_start = lexer->column;
-
+    
     switch (advance(lexer)) {
         case '(': return make_token(TOK_LPAREN, start_pos, 1, line_start, column_start);
         case ')': return make_token(TOK_RPAREN, start_pos, 1, line_start, column_start);
@@ -403,9 +348,43 @@ Token lexer_next(Lexer *const lexer) {
             if (match(lexer, '|')) return make_token(TOK_PIPE_PIPE, start_pos, 2, line_start, column_start);
             lex_error(lexer, "unexpected '|'");
             return make_token(TOK_UNKNOWN, start_pos, 1, line_start, column_start);
-        default:
-            lex_error(lexer, "unexpected character");
-            return make_token(TOK_UNKNOWN, start_pos, 1, line_start, column_start);
+        default: {
+            const unsigned char *start = (const unsigned char *)start_pos;
+            unsigned char b0 = start[0];
+
+            if (b0 < 0x80) {
+                lex_error(lexer, "unexpected character");
+                return make_token(TOK_UNKNOWN, (const char *)start, 1, line_start, column_start);
+            }
+
+            int len = (b0 & 0xE0) == 0xC0 ? 2 :
+                      (b0 & 0xF0) == 0xE0 ? 3 :
+                      (b0 & 0xF8) == 0xF0 ? 4 : -1;
+
+            if (len < 0) {
+                lex_error(lexer, "invalid UTF-8");
+                return make_token(TOK_UNKNOWN, (const char*)start, 1, line_start, column_start);
+            }
+
+            size_t remain = lexer->length - lexer->pos;
+            if (remain < (size_t)(len - 1)) {
+                lex_error(lexer, "invalid UTF-8");
+                return make_token(TOK_UNKNOWN, (const char*)start, 1, line_start, column_start);
+            }
+
+            for (int i = 0; i < len - 1; i++) {
+                unsigned char bi = (unsigned char)lexer->src[lexer->pos + i];
+                if ((bi & 0xC0) != 0x80) {
+                    lex_error(lexer, "invalid UTF-8");
+                    return make_token(TOK_UNKNOWN, (const char*)start, 1, line_start, column_start);
+                }
+            }
+
+            advance_bytes_no_col(lexer, (size_t)(len - 1));
+
+            lex_error(lexer, "non-ASCII character not allowed");
+            return make_token(TOK_UNKNOWN, (const char*)start, (size_t)len, line_start, column_start);
+        }
     }
 }
 
@@ -418,12 +397,12 @@ void lexer_init(Lexer *const lex, const char *s, size_t len) {
     lex->errors = NULL;
     lex->err_count = 0;
     lex->err_cap = 0;
-    lex->had_error = 0;
+    lex->had_error = false;
 }
 
-void dump_lex_errors(const Lexer *const lex) {
+void dump_lex_errors(const Lexer *const lex, const char *path) {
     for (int i = 0; i < lex->err_count; i++) {
-        printf("%zu:%zu: %s\n", lex->errors[i].line, lex->errors[i].column, lex->errors[i].msg);
+        printf("%s:%zu:%zu: lexical error: %s\n", path, lex->errors[i].line, lex->errors[i].column, lex->errors[i].msg);
     }
 }
 
@@ -438,12 +417,12 @@ TokenVec lexer_all(const char *path) {
     for (;;) {
         Token tok = lexer_next(&lexer);
         tokenvec_push(&vec, tok);
-        printf("type:%20s  lexeme:%30.*s  line:%5zu  column:%5zu\n",
-               token_type_name(tok.type), (int)tok.length, tok.start_pos,
-               tok.line, tok.column);
+        //printf("type:%20s  lexeme:%30.*s  line:%5zu  column:%5zu\n",
+          //     token_type_name(tok.type), (int)tok.length, tok.start_pos,
+            //   tok.line, tok.column);
         if (tok.type == TOK_EOF) break;
     }
     
-    if (lexer.had_error) { dump_lex_errors(&lexer); exit(1); }
+    if (lexer.had_error) { dump_lex_errors(&lexer, path); exit(EXIT_FAILURE); }
     return vec;
 }

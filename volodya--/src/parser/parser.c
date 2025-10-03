@@ -3,44 +3,15 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
-#include "Token.h"
-#include "TokenVec.h"
-#include "TokenNames.h"
-
-typedef enum {
-    NK_NUMBER,
-    NK_STRING,
-    NK_BOOLEAN,
-    NK_VAR,
-    NK_UNARY,
-    NK_BINARY,
-    NK_CALL,
-    NK_INDEX,
-    NK_FIELD,
-    NK_CAST,
-    NK_ARRAY_LIT,
-    NK_BREAK,
-    NK_IF,
-    NK_WHILE,
-    NK_FOR,
-    NK_RETURN,
-    NK_EXPR,
-    NK_BLOCK,
-    NK_ASSIGN,
-    NK_DECLEXPR,
-    NK_FN,
-    NK_PARAM,
-    NK_STRUCT,
-    NK_STC_FIELD,
-    NK_PROGRAM,
-    NK_ERROR
-} NodeKind;
+#include "../Token/TokenNames.h"
+#include "parser.h"
 
 typedef enum {
     SYNC_STMT,
     SYNC_EXPR,
     SYNC_PAREN,
     SYNC_BRACE,
+    SYNC_BLOCK,
     SYNC_BRACKET,
     SYNC_TOPLEVEL
 } SyncKind;
@@ -54,46 +25,9 @@ typedef struct {
     size_t last_error_pos;
 } ParserContext;
 
-typedef struct {
-    size_t array_depth;
-    size_t start_pos;
-    size_t end_pos;
-} TokenCast;
-
-typedef struct Node Node;
-typedef struct { Node **data; size_t length, cap; } NodeList;
-
-struct Node {
-    NodeKind kind;
-    union {
-        const char* error;
-        size_t boolean;
-        long long number;
-        struct { const char *start_pos; size_t length; } string;
-        struct { const char *start_pos; size_t length; } var;
-        NodeList array_lit;
-        struct { Token op; Node *expr; } unary;
-        struct { TokenCast tc; Node *expr; } cast;
-        struct { Token op; Node *lhs; Node *rhs; } binary;
-        struct { Node *called; NodeList args; } call;
-        struct { Node *array; Node *index; } index_;
-        struct { Node *strc; Node *var; } field;
-        struct { Node *cond; Node *stmt; } while_loop;
-        Node *return_stmt;
-        struct { Node *cond; Node *stmt; Node *else_chain; } if_stmt;
-        struct { int is_const; Node *type; Token name; Node *assign; } declexpr;
-        NodeList stmts;
-        Node *expr_stmt;
-        struct { NodeList init; Node *expr; NodeList step; Node *stmt; } for_stmt;
-        struct { TokenCast tc; Token name; NodeList params; Node *stmt; } fn;
-        struct { TokenCast tc; Token name; } param;
-        struct { Token name; NodeList fields; } struct_;
-        struct { Token name; Node *type; } stc_field;
-        NodeList program;
-    };
-};
-
-static inline Token peek(ParserContext *p) { return p->vec->data[p->pos]; }
+static inline Token peek(ParserContext *p) {
+    return p->vec->data[p->pos];
+}
 
 static inline Token peek_next(ParserContext *p) {
     Token t = p->vec->data[p->pos];
@@ -121,7 +55,7 @@ static inline int should_report(ParserContext *p, Token at) {
 static void error_tok(ParserContext *p, Token t, const char *msg) {
     if (!should_report(p, t)) return;
     if (p->err_count > 10) { fprintf(stderr, "too many errors\n"); exit(1); }
-    fprintf(stderr, "%s:%zu:%zu: error: %s\n", p->file, t.line, t.column, msg);
+    fprintf(stderr, "%s:%zu:%zu: syntax error: %s\n", p->file, t.line, t.column, msg);
     p->err_count++;
     begin_recovery(p);
 }
@@ -133,8 +67,9 @@ static int is_expr_sync(TokenType t) {
 }
 static int is_paren_sync(TokenType t) { return t==TOK_RPAREN || t==TOK_SEMICOLON || t==TOK_RBRACE || t==TOK_EOF; }
 static int is_brace_sync(TokenType t) { return t==TOK_RBRACE || t==TOK_EOF; }
+static int is_block_sync(TokenType t) { return t==TOK_LBRACE || t==TOK_EOF; }
 static int is_brack_sync(TokenType t) { return t==TOK_RBRACKET || t==TOK_EOF; }
-static int is_top_sync(TokenType t)  { return t==TOK_KW_FN || t==TOK_KW_STRUCT || t==TOK_RBRACE || t==TOK_EOF; }
+static int is_top_sync(TokenType t) { return t==TOK_KW_FN || t==TOK_KW_STRUCT || t==TOK_EOF; }
 
 static void sync(ParserContext *p, SyncKind k) {
     int (*pred)(TokenType) = NULL;
@@ -143,6 +78,7 @@ static void sync(ParserContext *p, SyncKind k) {
         case SYNC_EXPR: pred = is_expr_sync; break;
         case SYNC_PAREN: pred = is_paren_sync; break;
         case SYNC_BRACE: pred = is_brace_sync; break;
+        case SYNC_BLOCK: pred = is_block_sync;break;
         case SYNC_BRACKET: pred = is_brack_sync; break;
         case SYNC_TOPLEVEL: pred = is_top_sync; break;
     }
@@ -184,27 +120,27 @@ static Node* mk_error(const char *error) {
 
 static Node *mk_var(Token t) {
     Node *n = mk(NK_VAR);
-    n->var.start_pos = t.start_pos;
-    n->var.length = t.length;
+    n->var = t;
     return n;
 }
 
 static Node *mk_string(Token t) {
     Node *n = mk(NK_STRING);
-    n->string.start_pos = t.start_pos;
-    n->string.length = t.length;
+    n->string = t;
     return n;
 }
 
-static Node *mk_number(long long num) {
+static Node *mk_number(long long num, Token t) {
     Node *n = mk(NK_NUMBER);
-    n->number = num;
+    n->number.value = num;
+    n->number.t = t;
     return n;
 }
 
-static Node *mk_boolean(size_t value) {
+static Node *mk_boolean(size_t value, Token t) {
     Node *n = mk(NK_BOOLEAN);
-    n->boolean = value;
+    n->boolean.value = value;
+    n->boolean.t = t;
     return n;
 }
 
@@ -243,16 +179,33 @@ static Node *mk_field(Node *strc, Token t) {
     return n;
 }
 
-static Node *mk_cast(TokenCast tc, Node *expr) {
+static Node *mk_cast(Node *cast_type, Node *expr) {
     Node *n = mk(NK_CAST);
-    n->cast.tc = tc;
+    n->cast.cast_type = cast_type;
     n->cast.expr = expr;
     return n;
 }
 
-static Node *mk_while(Node *cond) {
+static Node *mk_assign(Node *lvalue, Node *rvalue) {
+    Node *n = mk(NK_ASSIGN);
+    n->assign.lvalue = lvalue; 
+    n->assign.rvalue = rvalue;
+    return n;
+}
+
+static Node *mk_declexpr(bool is_const, Node *type, Token name, Node *rvalue) {
+    Node *n = mk(NK_DECLEXPR);
+    n->declexpr.is_const = is_const;
+    n->declexpr.type = type;
+    n->declexpr.name = name;
+    n->declexpr.rvalue = rvalue;
+    return n;
+}
+
+static Node *mk_while(Node *cond, Node *stmt) {
     Node *n = mk(NK_WHILE);
     n->while_loop.cond = cond;
+    n->while_loop.stmt = stmt;
     return n;
 }
 
@@ -262,10 +215,62 @@ static Node *mk_return(Node *expr) {
     return n;
 }
 
-static Node *mk_if(Node *cond) {
+static Node *mk_if(Node *cond, Node *stmt) {
     Node *n = mk(NK_IF);
     n->if_stmt.cond = cond;
+    n->if_stmt.stmt = stmt;
     n->if_stmt.else_chain = NULL;
+    return n;
+}
+
+static Node *mk_for(NodeList forinit, Node *cond, NodeList forstep, Node *body) {
+    Node *n = mk(NK_FOR);
+    n->for_stmt.init = forinit;
+    n->for_stmt.expr = cond;
+    n->for_stmt.step = forstep;
+    n->for_stmt.stmt = body;
+    return n;        
+}
+
+static Node *mk_block(NodeList stmt_list) {
+    Node *n = mk(NK_BLOCK);
+    n->stmts = stmt_list;
+    return n;
+}
+
+static Node *mk_expr(Node *e) {
+    Node *n = mk(NK_EXPR);
+    n->expr_stmt = e;
+    return n;
+}
+
+static Node *mk_param(Token name, Node *type) {
+    Node *n = mk(NK_PARAM);
+    n->param.name = name;
+    n->param.p_type = type;
+    return n;
+}
+
+static Node *mk_fn(Node *ret_type, Token name, NodeList p_list, Node *stmt) {
+    Node *n = mk(NK_FN);
+    n->fn.ret_type = ret_type;
+    n->fn.name = name;
+    n->fn.params = p_list;
+    n->fn.stmt = stmt;
+    return n;
+}
+
+static Node *mk_stc_field(Token name, Node *type) {
+    Node *n = mk(NK_STC_FIELD);
+    n->stc_field.name = name;
+    n->stc_field.type = type;
+    return n;
+}
+
+static Node *mk_struct(Token name, NodeList f_list) {
+    Node *n = mk(NK_STRUCT);
+    n->struct_.name = name;
+    n->struct_.fields = f_list;
     return n;
 }
 
@@ -284,7 +289,7 @@ static int binary_op(TokenType type, size_t *lbp, size_t *rbp) {
 static Node *parse_expr(ParserContext *p, size_t min_bp);
 
 static inline int is_closer_or_sep(TokenType t){
-    return t==TOK_RPAREN||t==TOK_RBRACKET||t==TOK_RBRACE||t==TOK_COMMA||t==TOK_SEMICOLON;
+    return t==TOK_RPAREN || t==TOK_RBRACKET || t==TOK_RBRACE || t==TOK_COMMA || t==TOK_SEMICOLON;
 }
 
 static Node *err_eof(const char *a, ParserContext *p) {
@@ -296,7 +301,7 @@ static Node *convert(Token t, unsigned base) {
     const char *s = t.start_pos;
     size_t n = t.length;
 
-    if (base < 2 || base > 16) return mk_error("base");
+    if (base < 2 || base > 16) return mk_error("out of base err");
 
     unsigned long long acc = 0;
 
@@ -310,11 +315,11 @@ static Node *convert(Token t, unsigned base) {
         else if (ch >= 'A' && ch <= 'F') digit = ch - 'A' + 10;
 
         __uint128_t wide = (__uint128_t)acc * base + digit;
-        if (wide > UINT64_MAX) return mk_error("overflow");
+        if (wide > UINT64_MAX) return mk_error("overflow err");
         acc = (unsigned long long)wide;
     }
 
-    return mk_number(acc);
+    return mk_number(acc, t);
 }
 
 static Node *parse_primary_postfix(ParserContext *p) {
@@ -328,8 +333,8 @@ static Node *parse_primary_postfix(ParserContext *p) {
         case TOK_BIN_LIT: n = convert(consume(p), 2); break;
         case TOK_OCT_LIT: n = convert(consume(p), 8); break;
         case TOK_STRING_LIT: n = mk_string(consume(p)); break;
-        case TOK_KW_TRUE: n = mk_boolean(1); consume(p); break;
-        case TOK_KW_FALSE: n = mk_boolean(0); consume(p); break;
+        case TOK_KW_TRUE: n = mk_boolean(1, consume(p)); break;
+        case TOK_KW_FALSE: n = mk_boolean(0, consume(p)); break;
         case TOK_LPAREN:{
             consume(p);
             size_t err0 = p->err_count;
@@ -349,7 +354,7 @@ static Node *parse_primary_postfix(ParserContext *p) {
                 
                 if (err_before < p->err_count) {
                     sync(p, SYNC_BRACKET);
-                    return mk_error("array lit");
+                    return mk_error("array lit err");
                 }
 
                 while (match(p, TOK_COMMA)) {
@@ -374,12 +379,14 @@ static Node *parse_primary_postfix(ParserContext *p) {
         default:
             error_tok(p, peek(p), "expected expression");
             if (!is_closer_or_sep(t.type)) consume(p);
-            return mk_error("expression");
+            return mk_error("expression err");
     }
 
+    bool flag = false;
     for (;;) {
         Token t2 = peek(p);
         if (t2.type == TOK_LPAREN) {
+            flag = false;
             consume(p);
             if (peek(p).type == TOK_EOF) {
                 return err_eof("unexpected end of input, expected expression or ')'", p);
@@ -422,7 +429,12 @@ static Node *parse_primary_postfix(ParserContext *p) {
                 sync(p, SYNC_BRACKET);
             }
             expect_sync(p, TOK_RBRACKET, SYNC_BRACKET);
+            if (peek(p).type == TOK_LBRACKET) {
+                error_tok(p, peek(p), "multi-demensional arrays are not supported");
+                sync(p, SYNC_PAREN); break;
+            }
         } else if (t2.type == TOK_DOT && peek_next(p).type == TOK_IDENT) {
+            flag = false;
             consume(p);
             n = mk_field(n, consume(p));
         } else break;
@@ -440,33 +452,31 @@ static inline int is_bitype(Token t) {
         t.type == TOK_KW_U64 || t.type == TOK_KW_BOOL || t.type == TOK_KW_STRING;
 }
 
-static int try_parse_cast(ParserContext *p, TokenCast *tc) {
+static int try_parse_cast(ParserContext *p, Node *cast_type) {
     size_t tmp = p->pos;
     if (consume(p).type != TOK_LPAREN) { p->pos = tmp; return 0; }
     Token t = peek(p);
-    size_t start = p->pos;
-    size_t array_depth = 0;
 
-    if (is_bitype(t) || t.type == TOK_IDENT) consume(p);
+    if (is_bitype(t) || t.type == TOK_IDENT) cast_type = mk_var(consume(p));
     else { p->pos = tmp; return 0; }
     
-    for (; peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET;) {
-        consume(p); consume(p); array_depth++; 
+    if (peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
+        consume(p);
+        cast_type = (cast_type, mk_number(-1, consume(p)));
+        if (peek(p).type == TOK_LBRACKET) { p->pos = tmp; return 0; }
     }
 
-    size_t end = p->pos;
-
-    if (match(p, TOK_RPAREN)) { tc->start_pos = start; tc->end_pos = end; tc->array_depth = array_depth; return 1; }
+    if (match(p, TOK_RPAREN)) { return 1; }
     else { p->pos = tmp; return 0; }
 }
 
 static Node* parse_expr(ParserContext *p, size_t min_bp) {
     Node *left = NULL;
-    TokenCast tc;
+    Node *cast_type;
 
-    if (min_bp < 70 && try_parse_cast(p, &tc)) {
-        Node *n = parse_expr(p, 70);
-        left = mk_cast(tc, n);
+    if (try_parse_cast(p, cast_type)) {
+        Node *n = parse_expr(p, 80);
+        left = mk_cast(cast_type, n);
     } else if (is_unary(peek(p))) {
         Token op = consume(p);
         Node *n = parse_expr(p, 80);
@@ -495,8 +505,9 @@ static Node *parse_lvalue(ParserContext *p) {
         if (peek(p).type == TOK_LBRACKET) {
             consume(p);
             Node *idx = parse_expr(p, 0);
-            if (!match(p, TOK_RBRACKET)) { return NULL; }
+            if (!match(p, TOK_RBRACKET)) return NULL;
             n = mk_index(n, idx);
+            if (peek(p).type == TOK_LBRACKET) return NULL;
         } else if (peek(p).type == TOK_DOT && peek_next(p).type == TOK_IDENT) {
             consume(p);
             n = mk_field(n, consume(p));
@@ -505,73 +516,61 @@ static Node *parse_lvalue(ParserContext *p) {
     return n;
 }
 
-
 static int try_parse_assign_expr(ParserContext *p, Node **out) {
     size_t mark = p->pos;
-    Node *lhs = parse_lvalue(p);
-    if (!lhs) { p->pos = mark; return 0; }
+    Node *lvalue = parse_lvalue(p);
+    if (!lvalue) { p->pos = mark; return 0; }
     if (!match(p, TOK_EQ)) { p->pos = mark; return 0; }
-    Node *rhs = parse_expr(p, 0);
-    Node *n = mk(NK_ASSIGN);
-
-    n->binary.lhs = lhs; 
-    n->binary.rhs = rhs;
-    *out = n;
+    Node *rvalue = parse_expr(p, 0);
+    
+    *out = mk_assign(lvalue, rvalue);
     return 1;
 }
 
-
-static int try_parse_declexpr(ParserContext* p, Node** out) {
+static int try_parse_declexpr(ParserContext *p, Node **out) {
     size_t mark = p->pos;
-    int committed = 0;
-    int is_const = 0;
+    bool committed = false;
+    bool is_const = false;
     Node *n = NULL;
     
-    if (match(p, TOK_KW_CONST)) { is_const = 1; committed = 1; }
+    if (match(p, TOK_KW_CONST)) { is_const = true; committed = true; }
     Token name = {0};
 
     if (is_bitype(peek(p))) {
-        committed = 1;
+        committed = true;
         n = mk_var(consume(p));
-        for (;;) {
-            if (peek(p).type == TOK_LBRACKET) {
-                consume(p);
-                Node *idx = parse_expr(p, 0);
-                expect_sync(p, TOK_RBRACKET, SYNC_BRACKET);
-                n = mk_index(n, idx);
-            } else break;
+        if (peek(p).type == TOK_LBRACKET) {
+            consume(p);
+            Node *idx = parse_expr(p, 0);
+            expect_sync(p, TOK_RBRACKET, SYNC_BRACKET);
+            n = mk_index(n, idx);
         }
-        if (peek(p).type == TOK_IDENT) name = consume(p);
-        else error_tok(p, peek(p), "expected name after type");
+        Token tmp = peek(p);
+        if (tmp.type == TOK_LBRACKET) error_tok(p, tmp, "multi-demensional arrays are not supported");
+        else if (tmp.type == TOK_IDENT) name = consume(p);
+        else error_tok(p, tmp, "expected name after type");
     } else if (peek(p).type == TOK_IDENT) {
         n = mk_var(consume(p));
-        for (;;) {
-            if (peek(p).type == TOK_LBRACKET) {
-                consume(p);
-                Node *idx = parse_expr(p, 0);
-                if (!match(p, TOK_RBRACKET)) { p->pos = mark; return 0; }
-                n = mk_index(n, idx);
-            } else break;
+        if (peek(p).type == TOK_LBRACKET) {
+            consume(p);
+            Node *idx = parse_expr(p, 0);
+            if (!match(p, TOK_RBRACKET)) { p->pos = mark; return 0; }
+            n = mk_index(n, idx);
         }
-        if (peek(p).type != TOK_IDENT) {
+        Token tmp = peek(p);
+        if (tmp.type == TOK_LBRACKET) { p->pos = mark; return 0; }
+        else if (tmp.type != TOK_IDENT) {
             if (!committed) { p->pos = mark; return 0; }
-            error_tok(p, peek(p), "expected name after type");
+            error_tok(p, tmp, "expected name after type");
         } else name = consume(p);
-    } else if (is_const == 1) {
+    } else if (is_const) {
         error_tok(p, peek(p), "expected type after const");
     } else { p->pos = mark; return 0; }
         
     Node *init = NULL;
-    if (match(p, TOK_EQ)) {
-        init = parse_expr(p, 0);
-    }
+    if (match(p, TOK_EQ)) { init = parse_expr(p, 0); }
     
-    Node *nd = mk(NK_DECLEXPR);
-    nd->declexpr.is_const = is_const;
-    nd->declexpr.type = n;
-    nd->declexpr.name = name;
-    nd->declexpr.assign = init;
-    *out = nd;
+    *out = mk_declexpr(is_const, n, name, init);
     return 1;
 }
 
@@ -588,7 +587,7 @@ static inline void init(NodeList *l, ParserContext *p) {
 }
 
 static NodeList forinit(ParserContext *p) {
-    NodeList list = {NULL, 0, 0};
+    NodeList list = (NodeList){NULL, 0, 0};
     init(&list, p);
 
     while (peek(p).type == TOK_COMMA) { 
@@ -601,15 +600,12 @@ static NodeList forinit(ParserContext *p) {
 
 static inline void step(NodeList *l, ParserContext *p) {
     Node *n = NULL;
-    if (try_parse_assign_expr(p, &n)) {
-        push(l, n);
-    } else {
-        push(l, parse_expr(p, 0));
-    }
+    if (try_parse_assign_expr(p, &n)) { push(l, n); }
+    else { push(l, parse_expr(p, 0)); }
 }
 
 static NodeList forstep(ParserContext *p) {
-    NodeList list = {NULL, 0, 0};
+    NodeList list = (NodeList){NULL, 0, 0};
     step(&list, p);
 
     while (peek(p).type == TOK_COMMA) {
@@ -625,6 +621,7 @@ static Node *parse_block(ParserContext *p);
 static Node *diispecherzadach(ParserContext *p) {
     switch (peek(p).type) {
         case TOK_LBRACE: return parse_block(p);
+        case TOK_SEMICOLON: consume(p); return NULL;
         case TOK_KW_BREAK: consume(p); expect_sync(p, TOK_SEMICOLON, SYNC_STMT); return mk(NK_BREAK);
         case TOK_KW_RETURN:{
             consume(p);
@@ -635,39 +632,37 @@ static Node *diispecherzadach(ParserContext *p) {
         }
         case TOK_KW_WHILE:{
             consume(p);
-            if (!expect_sync(p, TOK_LPAREN, SYNC_PAREN)) return mk_error("while");
+            if (!expect_sync(p, TOK_LPAREN, SYNC_PAREN)) return mk_error("while err");
             Node *c = parse_expr(p, 0);
             expect_sync(p, TOK_RPAREN, SYNC_PAREN);
-            Node *n = mk_while(c);
-            n->while_loop.stmt = diispecherzadach(p);
-            return n;
+            return mk_while(c, diispecherzadach(p));
         }
         case TOK_KW_IF:{
             consume(p);
-            if (!expect_sync(p, TOK_LPAREN, SYNC_PAREN)) return mk_error("if");
+            if (!expect_sync(p, TOK_LPAREN, SYNC_PAREN)) return mk_error("if err");
             Node *c = parse_expr(p, 0);
             expect_sync(p, TOK_RPAREN, SYNC_PAREN);
-            Node *n = mk_if(c);
-            n->if_stmt.stmt = diispecherzadach(p);
+            Node *n = mk_if(c, diispecherzadach(p));
             if (match(p, TOK_KW_ELSE)) n->if_stmt.else_chain = diispecherzadach(p);
             return n;
         }
         case TOK_KW_FOR: {
             consume(p);
-            if (!expect_sync(p, TOK_LPAREN, SYNC_PAREN)) return mk_error("for");
+            if (!expect_sync(p, TOK_LPAREN, SYNC_PAREN)) return mk_error("for err");
 
             NodeList fi = {0};
             Node *cond = NULL;
             NodeList st = {0};
-
-            if (!match(p, TOK_SEMICOLON)) { fi = forinit(p); expect_sync(p, TOK_SEMICOLON, SYNC_PAREN); }
-            if (!match(p, TOK_SEMICOLON)) { cond = parse_expr(p, 0); expect_sync(p, TOK_SEMICOLON, SYNC_PAREN); }
-            if (!match(p, TOK_RPAREN))    { st = forstep(p); expect_sync(p, TOK_RPAREN, SYNC_PAREN); }
-
+            if (peek(p).type == TOK_RPAREN) 
+                error_tok(p, consume(p), "did you mean ';;' for an empty for loop initializer?");
+            else {
+                if (!match(p, TOK_SEMICOLON)) { fi = forinit(p); expect_sync(p, TOK_SEMICOLON, SYNC_PAREN); }
+                if (peek(p).type == TOK_RPAREN) error_tok(p, peek(p), "expect expresion and/or TOK_SEMICOLON");
+                else if (!match(p, TOK_SEMICOLON)) { cond = parse_expr(p, 0); expect_sync(p, TOK_SEMICOLON, SYNC_PAREN); }
+                if (!match(p, TOK_RPAREN)) { st = forstep(p); expect_sync(p, TOK_RPAREN, SYNC_PAREN); }
+            }
             Node *body = diispecherzadach(p);
-            Node *loop = mk(NK_FOR);
-            loop->for_stmt.init = fi; loop->for_stmt.expr = cond; loop->for_stmt.step = st; loop->for_stmt.stmt = body;
-            return loop;
+            return mk_for(fi, cond, st, body);
         }
         default: {
             size_t err0 = p->err_count;
@@ -675,22 +670,22 @@ static Node *diispecherzadach(ParserContext *p) {
             Node *decl = NULL;
             if (try_parse_declexpr(p, &decl)) {
                 expect_sync(p, TOK_SEMICOLON, SYNC_STMT);
-                if (p->err_count > err0) return mk_error("declexpr");
+                if (p->err_count > err0) return mk_error("declexpr err");
                 return decl;
             }
 
             Node *asg = NULL;
             if (try_parse_assign_expr(p, &asg)) {
                 expect_sync(p, TOK_SEMICOLON, SYNC_STMT);
-                if (p->err_count > err0) return mk_error("assign expr");
+                if (p->err_count > err0) return mk_error("assign expr err");
                 return asg;
             }
 
             Node *e = parse_expr(p, 0);
             expect_sync(p, TOK_SEMICOLON, SYNC_STMT);
-            if (p->err_count > err0) return mk_error(" exprstmt");
+            if (p->err_count > err0) return mk_error("exprstmt err");
 
-            Node *n = mk(NK_EXPR); n->expr_stmt = e; return n;
+            return mk_expr(e);
         }
     }
 }
@@ -700,43 +695,40 @@ static Node *parse_block(ParserContext *p) {
     NodeList stmt_list = (NodeList){0};
 
     while (peek(p).type != TOK_RBRACE && peek(p).type != TOK_EOF) {
-        size_t err0 = p->err_count;
         Node *stmt = diispecherzadach(p);
         push(&stmt_list, stmt);
-        if (p->err_count > err0) sync(p, SYNC_STMT);
     }
 
     expect_sync(p, TOK_RBRACE, SYNC_BRACE);
-    Node *n = mk(NK_BLOCK);
-    n->stmts = stmt_list;
-    return n;
+    return mk_block(stmt_list);
 }
 
 
 static NodeList parse_param(ParserContext *p) {
-    NodeList list = {NULL, 0, 0};
+    NodeList list = (NodeList){NULL, 0, 0};
     while (peek(p).type == TOK_IDENT) {
-        Node *n = mk(NK_PARAM);
         Token t = consume(p);
+        Node *p_type = NULL;
         expect_sync(p, TOK_COLON, SYNC_PAREN);
-        size_t depth = 0;
-        size_t start = p->pos;
 
         if (is_bitype(peek(p)) || peek(p).type == TOK_IDENT) {
-        consume(p);
-            while (peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
-                consume(p); consume(p); depth++;
+        p_type = mk_var(consume(p));
+            if (peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
+                consume(p);
+                p_type = mk_index(p_type, mk_number(-1, consume(p)));
+                if (peek(p).type == TOK_LBRACKET) {
+                    error_tok(p, peek(p), "multi-demensional arrays are not supported");
+                    sync(p, SYNC_PAREN);
+                    return list;
+                }
             }
         } else {
             error_tok(p, t, "expected type");
             sync(p, SYNC_PAREN);
+            return list;
         }
 
-        n->param.tc.array_depth = depth;
-        n->param.tc.start_pos = start;
-        n->param.tc.end_pos = p->pos;
-        n->param.name = t;
-        push(&list, n);
+        push(&list, mk_param(t, p_type));
         if (match(p, TOK_COMMA)) { 
             if (peek(p).type != TOK_IDENT) error_tok(p, peek(p), "trailing comma");
         } else break;
@@ -745,23 +737,29 @@ static NodeList parse_param(ParserContext *p) {
 }
 
 static Node *parse_fn(ParserContext *p) {
-    size_t start = p->pos;
-    size_t depth = 0;
     Token t = peek(p);
+    Node *ret_type = NULL;
 
     if (is_bitype(t) || t.type == TOK_IDENT || t.type == TOK_KW_VOLOID) {
-        consume(p);
-        while (peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
-            consume(p); consume(p); depth++;
+        ret_type = mk_var(consume(p));
+        if (peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
+            consume(p);
+            ret_type = mk_index(ret_type, mk_number(-1, consume(p)));
+            if (peek(p).type == TOK_LBRACKET) {
+                error_tok(p, peek(p), "multi-demensional arrays are not supported");
+                sync(p, SYNC_BLOCK);
+                Node *stmt = diispecherzadach(p);
+                return mk_error("fn err");
+            }
         }
     } else {
         error_tok(p, t, "expected return type");
-        sync(p, SYNC_TOPLEVEL);
-        return mk_error("fn");
+        sync(p, SYNC_BLOCK);
+        Node *stmt = diispecherzadach(p);
+        return mk_error("fn err");
     }
 
-    size_t end = p->pos;
-    Token name = {0};
+    Token name = (Token){0};
 
     if (peek(p).type != TOK_IDENT) { error_tok(p, peek(p), "expected name"); }
     else name = consume(p);
@@ -772,14 +770,7 @@ static Node *parse_fn(ParserContext *p) {
 
     Node *stmt = diispecherzadach(p);
 
-    Node *n = mk(NK_FN);
-    n->fn.tc.start_pos = start;
-    n->fn.tc.end_pos = end;
-    n->fn.tc.array_depth = depth;
-    n->fn.name = name;
-    n->fn.params = list;
-    n->fn.stmt = stmt;
-    return n;
+    return mk_fn(ret_type, name, list, stmt);
 }
 
 static NodeList parse_field(ParserContext *p) {
@@ -793,22 +784,22 @@ static NodeList parse_field(ParserContext *p) {
         if (is_bitype(t) || t.type == TOK_IDENT) {
             n = mk_var(t);
             consume(p);
-            while (peek(p).type == TOK_LBRACKET) {
+            if (peek(p).type == TOK_LBRACKET) {
                 consume(p);
                 n = mk_index(n, parse_expr(p, 0));
                 expect_sync(p, TOK_RBRACKET, SYNC_BRACKET);
+                if (peek(p).type == TOK_LBRACKET) {
+                    error_tok(p, peek(p), "multi-demensional arrays are not supported");
+                    sync(p, SYNC_PAREN);
+                }
             }
         } else {
             error_tok(p, peek(p), "expected name");
-            sync(p, SYNC_BRACE);
+            sync(p, SYNC_PAREN);
         }
 
         expect_sync(p, TOK_SEMICOLON, SYNC_BRACE);
-
-        Node *field = mk(NK_STC_FIELD);
-        field->stc_field.name = name;
-        field->stc_field.type = n;
-        push(&fields, field);
+        push(&fields, mk_stc_field(name, n));
     }
     return fields;
 }
@@ -819,7 +810,7 @@ static Node *parse_struct(ParserContext *p) {
     if (peek(p).type != TOK_IDENT) {
         error_tok(p, peek(p), "expected name");
         sync(p, SYNC_TOPLEVEL);
-        return mk_error("struct");
+        return mk_error("struct err");
     }
     name = consume(p);
 
@@ -827,16 +818,13 @@ static Node *parse_struct(ParserContext *p) {
     NodeList list = parse_field(p);
     expect_sync(p, TOK_RBRACE, SYNC_BRACE);
 
-    Node *n = mk(NK_STRUCT);
-    n->struct_.name = name;
-    n->struct_.fields = list;
-    return n;
+    return mk_struct(name, list);
 }
 
 static NodeList parse_program(ParserContext *p) {
-    NodeList program = {0};
+    NodeList program = (NodeList){0};
     while (peek(p).type != TOK_EOF) {
-        if (match(p, TOK_KW_FN))      { push(&program, parse_fn(p)); }
+        if (match(p, TOK_KW_FN)) { push(&program, parse_fn(p)); }
         else if (match(p, TOK_KW_STRUCT)) { push(&program, parse_struct(p)); }
         else {
             error_tok(p, peek(p), "expected 'fn' or 'struct' at toplevel");
@@ -847,12 +835,12 @@ static NodeList parse_program(ParserContext *p) {
     return program;
 }
 
-void dump_parser(size_t d, Node *n, ParserContext *p) {
+static void dump_parser(size_t d, Node *n, ParserContext *p) {
     for (int i = 0; i < d; i++) printf(" ");
     if (!n) { printf("(null)\n"); return; }
     switch (n->kind) {
-        case NK_NUMBER: printf("Number(%lld)", n->number); break;
-        case NK_BOOLEAN: printf("Boolean(%d)", n->boolean ? 1 : 0); break;
+        case NK_NUMBER: printf("Number(%lld)", n->number.value); break;
+        case NK_BOOLEAN: printf("Boolean(%d)", n->boolean.value ? 1 : 0); break;
         case NK_VAR: printf("Var(%.*s)", (int)n->var.length, n->var.start_pos); break;
         case NK_STRING: printf("String(%.*s)", (int)n->string.length, n->string.start_pos); break;
         case NK_CALL:
@@ -888,10 +876,7 @@ void dump_parser(size_t d, Node *n, ParserContext *p) {
             printf("\n)"); break;
         case NK_CAST:
             printf("cast (type:'");
-            for (size_t i = n->cast.tc.start_pos; i < n->cast.tc.end_pos; i++) {
-                printf("%.*s", (int)p->vec->data[i].length, p->vec->data[i].start_pos);
-            }
-            printf("' depth: %zu\n", n->cast.tc.array_depth);
+            dump_parser(0, n->cast.cast_type, p);
             dump_parser(d + 1, n->cast.expr, p);
             printf("\n)"); break;
         case NK_ARRAY_LIT:
@@ -916,19 +901,19 @@ void dump_parser(size_t d, Node *n, ParserContext *p) {
             dump_parser(0, n->if_stmt.else_chain, p); break;
         case NK_ASSIGN:
             printf("lvalue: ");
-            dump_parser(d, n->binary.lhs, p);
+            dump_parser(d, n->assign.lvalue, p);
             printf(" value: ");
-            dump_parser(d, n->binary.rhs, p); break;
+            dump_parser(d, n->assign.rvalue, p); break;
         case NK_DECLEXPR:
             printf("const: %d ", n->declexpr.is_const);
-            printf("signature: ");
+            printf("type: ");
             dump_parser(0, n->declexpr.type, p);
             printf(" name: %.*s", (int)n->declexpr.name.length, n->declexpr.name.start_pos);
             printf(" value: ");
-            dump_parser(d, n->declexpr.assign, p); printf("\n"); break;
+            dump_parser(d, n->declexpr.rvalue, p); printf("\n"); break;
         case NK_EXPR: printf("expr_stmt: "); dump_parser(d, n->expr_stmt, p); break;
         case NK_BLOCK: printf("{\n");
-            for (int i = 0; i < n->stmts.length; i++) {
+            for (size_t i = 0; i < n->stmts.length; i++) {
                 dump_parser(0, n->stmts.data[i], p);
                 i == n->stmts.length - 1 ? : printf("\n");
             }
@@ -949,19 +934,13 @@ void dump_parser(size_t d, Node *n, ParserContext *p) {
             printf("\nstmt:\n");
             dump_parser(0, n->for_stmt.stmt, p); break;
         case NK_PARAM:
-            printf("param signature: ");
-            for (int i = n->param.tc.start_pos; i < n->param.tc.end_pos; i++) {
-                printf("%.*s", (int)p->vec->data[i].length, p->vec->data[i].start_pos);
-            }
-            printf(" array depth: %zu", n->param.tc.array_depth);
+            printf("param: ");
+            dump_parser(0, n->param.p_type, p);
             printf(" name: %.*s", (int)n->param.name.length, n->param.name.start_pos);
             break;
         case NK_FN:
-            printf("\nfn signature: ");
-            for (int i = n->fn.tc.start_pos; i < n->fn.tc.end_pos; i++) {
-                printf("%.*s", (int)p->vec->data[i].length, p->vec->data[i].start_pos);
-            }
-            printf(" array depth: %zu", n->fn.tc.array_depth);
+            printf("\nfn return: ");
+            dump_parser(0, n->fn.ret_type, p);
             printf(" name: %.*s\n", (int)n->fn.name.length, n->fn.name.start_pos);
             for (int i = 0; i < n->fn.params.length; i++) {
                 dump_parser(0, n->fn.params.data[i], p);
@@ -989,10 +968,11 @@ void dump_parser(size_t d, Node *n, ParserContext *p) {
     }
 }
 
-void parse(TokenVec vec) {
-    ParserContext p = { .file = "test.vol", .vec = &vec, .pos = 0 };
+Node *parse(TokenVec vec,const char *path) {
+    ParserContext p = (ParserContext){ .file = path, .vec = &vec, .pos = 0 };
     Node *n = mk(NK_PROGRAM);
     n->program = parse_program(&p);
     dump_parser(0, n, &p);
-    if (p.err_count) fprintf(stderr, "errors: %zu\n", p.err_count);
+    //if (p.err_count) fprintf(stderr, "errors: %zu\n", p.err_count);
+    return n;
 }

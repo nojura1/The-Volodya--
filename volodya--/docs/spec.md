@@ -1,30 +1,32 @@
 # Specification for the Volodya-- programming language
 
 ## 1. Introduction
-The Volodya-- programming language is an imperative and procedural (possibly object-oriented?) C-like programming language oriented toward (systems programming?). It is designed to be simple enough, but encourages disciplined programming. The main purpose is to explore the behavior of programming languages more deeply and fully understand all the nuances of compiler building. The secondary purpose is to write a small program using it. The Volodya-- programming language was inspired by C (but organized rather differently?).
+The Volodya-- programming language is an imperative and procedural C-like programming language oriented toward general programming. It is designed to be simple enough, but encourages disciplined programming. The main purpose is to explore the behavior of programming languages more deeply and fully understand all the nuances of compiler building. The secondary purpose is to write a small program using it. The Volodya-- programming language was inspired by C.
 
-The Volodya-- programming language is statically, strongly, nominally, and explicitly typed. Casting has to be explicit both ways. Compilation consists of translating source code into assembly. (Polymorphism?)
+The Volodya-- programming language is statically, strongly, nominally, and explicitly typed. Casting has to be explicit both ways. Compiler operaters ahead of time translating source code into assembly.
 
 The Volodya-- programming language is a relatively low-level language. It includes manual memory management with a free and malloc commands.
 
 ## 2. Lexical structure
 | Categories     | Examples                                                                            
 |----------------|-------------------------------------------------------------------------------------------
-| Keywords       | `fn`, `if`, `else`, `while`, `return`, `struct`, `i32`, `i64`, `u32`, `u64`, `bool`, `string`, `break`, `const`, `for`,  `voloid` (`continue`, `b32`, `b64`, `char`, `switch`, `case`, `free`, `malloc`)
-| Operators      | `+ - * / %`, `&& \|\| !`, `== != < > <= >=`, `=` (`\| & ~ ^`)
+| Keywords       | `fn`, `if`, `else`, `while`, `return`, `struct`, `i32`, `i64`, `u32`, `u64`, `bool`, `string`, `break`, `const`, `for`,  `voloid` (`free`, `malloc`)
+| Operators      | `+ - * / %`, `&& \|\| !`, `== != < > <= >=`, `=`
 | Separators     | `(` `)` `{` `}` `[` `]` `,` `.` `:` `;`
-| Literals       | integers `123`, booleans `true/false`, strings `"text"`, escape sequences `\"` (characters `'a'`, floating point numbers `1.23`)
+| Literals       | integers `123`, booleans `true/false`, strings `"text"`, escape sequences `\"`
 | Identifiers    | `[A-Za-z][A-Za-z0-9_]*`
 
 ## 3. Types
-| Type     | Description                    | Size     |
-|----------|--------------------------------|----------|
-| `i32`    | 32-bit signed integer          | 4 bytes  |
-| `i64`    | 64-bit signed integer          | 8 bytes  |
-| `u32`    | 32-bit unsigned integer        | 4 bytes  |
-| `u64`    | 64-bit unsigned integer        | 8 bytes  |
-| `bool`   | Logical (`0` / `1`)            | 4 bytes  |
-| `string` | Immutable UTF-8 string         | 16 bytes |
+| Type        | Description                         | Size              |
+|-------------|-------------------------------------|-------------------|
+| `voloid`    | Absence of value (function return)      | 0 bytes       |
+| `i32`       | 32-bit signed integer                   | 4 bytes       |
+| `i64`       | 64-bit signed integer                   | 8 bytes       |
+| `u32`       | 32-bit unsigned integer                 | 4 bytes       |
+| `u64`       | 64-bit unsigned integer                 | 8 bytes       |
+| `bool`      | Logical value (`0` = false, `1` = true) | 4 bytes       |
+| `string[N]` | UTF-8 string of fixed length `N`        | N bytes       |
+| `struct`    | User-defined type                       | Depends on definition |
 
 ## 4. Syntactic Specification
 ### 4.1 Notational Conventions
@@ -50,14 +52,14 @@ Example: Expr ::= Term { ("+" | "-") Term }
 Program      ::= { Function | Struct } ;
 Struct       ::= "struct" IDENT "{" { StructField } "}" ;
 StructField  ::= IDENT ":" Type ";" ;
-Function     ::= "fn" ( "voloid" | PrimaryType { "[" "]" } ) IDENT "(" [ Param { "," Param } ] ")" Block ;
-Param        ::= IDENT ":" PrimaryType { "[" "]" } ;
+Function     ::= "fn" ( "voloid" | PrimaryType [ ArraySuffix ] ) IDENT "(" [ Param { "," Param } ] ")" Block ;
+Param        ::= IDENT ":" PrimaryType [ ArraySuffix ] ;
 Block        ::= "{" { Stmt } "}" ;
 Stmt         ::= DeclStmt | IfStmt | WhileStmt | ForStmt | AssignStmt
                | ReturnStmt | BreakStmt | ExprStmt | Block | ";" ;
 DeclStmt     ::= DeclExpr ";" ;
 AssignStmt   ::= AssignExpr ";" ;
-Type         ::= PrimaryType { PostfixArray };
+Type         ::= PrimaryType [ PostfixArray ] ;
 PrimaryType  ::= BUILTIN_TYPE | IDENT ;
 PostfixArray ::= "[" Expr "]" ;
 IfStmt       ::= "if" "(" Expr ")" Stmt [ "else" Stmt ] ;
@@ -81,7 +83,7 @@ ExprRel      ::= ExprAdd { ("<" | "<=" | ">" | ">=") ExprAdd } ;
 ExprAdd      ::= ExprMul { ( "+" | "-" ) ExprMul } ; 
 ExprMul      ::= ExprCast { ( "*" | "/" | "%" ) ExprCast } ;
 ExprCast     ::= [ "(" CastType ")" ] ExprUnary ;
-CastType     ::= ( BUILTIN_TYPE | IDENT ) { ArraySuffix } ;
+CastType     ::= PrimaryType [ ArraySuffix ] ;
 ArraySuffix  ::= "[" "]" ;
 ExprUnary    ::= ( "-" | "+" | "!" ) ExprUnary | ExprPostfix ;
 ExprPostfix  ::= ExprPrimary { PostfixOp } ;
@@ -109,6 +111,10 @@ EscapeSeq    ::= "\\" | "\"" | "\n" | "\t" | "\r" ;
 BOOL_LIT     ::= "true" | "false" ;
 ```
 
+## 5. Semantic analysis
+
+
+
 ## 6. Examples
 ### 1. hello.vol
 ```Volodya--
@@ -130,7 +136,7 @@ fn bool cmp(x:u64, y:u64) {
     return x >= y && x != 0;
 }
 ```
-boolean expressions with relational (>=, !=) and logical (&&) operators. Also shows unsigned integer types.
+Boolean expressions with relational (>=, !=) and logical (&&) operators. Also shows unsigned integer types.
 ### 4. literals.vol
 ```Volodya--
 const i32 BIN = 0B1010_0101;
@@ -218,9 +224,8 @@ fn voloid main() {
     const u64 HEX = 0xDEAD_BEEF;
     const u32 BIN = 0b1010_1010;
     const bool FLAG = false;
-    Pair p;
-    p.a = 2;
-    p.b = 1;
+    Pair p; p.a = 2; p.b = 1;
+
     i32 sum = p.a + p.b;
 
     for (i32 i = 0; i < 5; i = i + 1) {

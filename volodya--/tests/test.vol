@@ -1,6 +1,3 @@
-struct S { a:i32; b:i32; }
-
-fn i32 al() {
-    for (i32 i = 0; i < 5; i=i+1
-        print("a", "b"
-    }
+fn i32[] dead() {
+    Volodya volJR = 228;
+}
