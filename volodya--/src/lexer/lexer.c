@@ -8,6 +8,11 @@
 #include "../Token/TokenVec.h"
 #include "../Token/TokenNames.h"
 
+#define MAX_FILE_SIZE (32 * 1024 * 1024)
+#define MAX_LEXEME_LEN (256)
+#define MAX_STRING_LITERAL_LEN (4 * 1024)
+#define MAX_TOKEN_AMOUNT (64 * 1024)
+
 typedef struct {
     size_t line;
     size_t column;
@@ -26,6 +31,7 @@ typedef struct Lexer {
     LexError *errors;
     size_t err_count, err_cap;
     bool had_error;
+    const char *path;
 } Lexer;
 
 static const Keyword keywords[] = {
@@ -38,7 +44,7 @@ static const Keyword keywords[] = {
     {"return", TOK_KW_RETURN},
     {"break",  TOK_KW_BREAK},
     {"const",  TOK_KW_CONST},
-    {"voloid",   TOK_KW_VOLOID},
+    {"voloid", TOK_KW_VOLOID},
     {"i32",    TOK_KW_I32},
     {"i64",    TOK_KW_I64},
     {"u32",    TOK_KW_U32},
@@ -55,6 +61,7 @@ char *read_file(const char *path, size_t *len_out) {
 
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long end = ftell(f);
+    if (end > MAX_FILE_SIZE) { fclose(f); fprintf(stderr, "fatal: file is too long %s\n", path); exit(EXIT_FAILURE); }
     if (end < 0) { fclose(f); return NULL; }
     rewind(f);
 
@@ -117,6 +124,8 @@ static inline Token make_token(TokenType type, const char *start, size_t l, size
     return (Token){type, start, l, line, column};
 }
 
+void dump_lex_errors(const Lexer *const lex);
+
 void lex_error(Lexer *const lexer, const char *msg) {
     lexer->had_error = true;
 
@@ -128,7 +137,10 @@ void lex_error(Lexer *const lexer, const char *msg) {
             exit(EXIT_FAILURE);
         }
     }
-    
+    if (lexer->err_count >= 10) {
+        dump_lex_errors(lexer);
+        exit(EXIT_FAILURE);
+    }
     size_t t = lexer->err_count++;
     lexer->errors[t].msg = msg;
     lexer->errors[t].line = lexer->line;
@@ -169,7 +181,9 @@ static Token scan_identifier(Lexer *const lexer) {
     size_t column_start = lexer->column;
 
     if (isalpha((unsigned char) peek(lexer))) {
-        for (; isalnum((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer));
+        for (size_t i = 0; isalnum((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer), ++i) {
+            if (i == MAX_LEXEME_LEN) lex_error(lexer, "too long identifier");
+        }
     }
 
     size_t l = lexer->src + lexer->pos - start_pos;
@@ -189,7 +203,9 @@ static Token scan_with_prefix(Lexer *const lexer, int (*fun)(int), TokenType tt)
     else if (!fun((unsigned char) c)) lex_error(lexer, "expected digit after prefix");
 
     if (fun((unsigned char) peek(lexer))) {
-        for (; fun((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer));
+        for (size_t i = 0; fun((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer), ++i) {
+            if (i == MAX_LEXEME_LEN) lex_error(lexer, "too long numeric literal");
+        }
     }
 
     c = peek(lexer);
@@ -213,7 +229,9 @@ static Token scan_dec(Lexer *const lexer) {
     size_t column_start = lexer->column;
 
     if (no_zero(peek(lexer))) {
-        for (; isdigit((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer));
+        for (size_t i = 0; isdigit((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer), ++i) {
+            if (i == MAX_LEXEME_LEN) lex_error(lexer, "too long numeric literal"); 
+        }
     } else advance(lexer);
 
     char c = peek(lexer);
@@ -247,7 +265,8 @@ static Token scan_string(Lexer *lexer) {
 
     advance(lexer);
 
-    while (1) {
+    for (size_t i = 0;; ++i) {
+        if (i == MAX_STRING_LITERAL_LEN) lex_error(lexer, "too long string literal");
         unsigned char c = peek(lexer);
         
         if ((c & 0xE0) == 0xC0) { advance_bytes_col(lexer, 2); continue; }
@@ -388,8 +407,9 @@ Token lexer_next(Lexer *const lexer) {
     }
 }
 
-void lexer_init(Lexer *const lex, const char *s, size_t len) {
+void lexer_init(Lexer *const lex, const char *s, size_t len, const char *path) {
     lex->src = s;
+    lex->path = path;
     lex->length = len;
     lex->pos = 0;
     lex->line = 1;
@@ -400,9 +420,9 @@ void lexer_init(Lexer *const lex, const char *s, size_t len) {
     lex->had_error = false;
 }
 
-void dump_lex_errors(const Lexer *const lex, const char *path) {
-    for (int i = 0; i < lex->err_count; i++) {
-        printf("%s:%zu:%zu: lexical error: %s\n", path, lex->errors[i].line, lex->errors[i].column, lex->errors[i].msg);
+void dump_lex_errors(const Lexer *const lex) {
+    for (size_t i = 0; i < lex->err_count; i++) {
+        printf("%s:%zu:%zu: lexical error: %s\n", lex->path, lex->errors[i].line, lex->errors[i].column, lex->errors[i].msg);
     }
 }
 
@@ -410,11 +430,12 @@ TokenVec lexer_all(const char *path) {
     size_t len = 0;
     char *src = read_file_or_exit(path, &len);
     Lexer lexer;
-    lexer_init(&lexer, src, len);
+    lexer_init(&lexer, src, len, path);
     TokenVec vec; 
     tokenvec_init(&vec);
 
-    for (;;) {
+    for (size_t i = 0;; ++i) {
+        if (i == MAX_TOKEN_AMOUNT) { lex_error(&lexer, "too many tokens"); break; }
         Token tok = lexer_next(&lexer);
         tokenvec_push(&vec, tok);
         //printf("type:%20s  lexeme:%30.*s  line:%5zu  column:%5zu\n",
@@ -423,6 +444,6 @@ TokenVec lexer_all(const char *path) {
         if (tok.type == TOK_EOF) break;
     }
     
-    if (lexer.had_error) { dump_lex_errors(&lexer, path); exit(EXIT_FAILURE); }
+    if (lexer.had_error) { dump_lex_errors(&lexer); exit(EXIT_FAILURE); }
     return vec;
 }

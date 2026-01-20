@@ -1,14 +1,18 @@
 #pragma once
+#include "../semantic/semantic.h"
 
 typedef enum {
     NK_NUMBER,
     NK_STRING,
     NK_BOOLEAN,
-    NK_VAR,
+    NK_T_BUILTIN,
+    NK_T_IDENT,
+    NK_IDENT,
     NK_UNARY,
     NK_BINARY,
     NK_CALL,
     NK_INDEX,
+    NK_T_ARRAY,
     NK_FIELD,
     NK_CAST,
     NK_ARRAY_LIT,
@@ -29,40 +33,40 @@ typedef enum {
     NK_ERROR
 } NodeKind;
 
-typedef struct {
-    size_t array_depth;
-    size_t start_pos;
-    size_t end_pos;
-} TokenCast;
-
 typedef struct Node Node;
 typedef struct { Node **data; size_t length, cap; } NodeList;
 
 struct Node {
     NodeKind kind;
+    bool is_lvalue;
+    Type *type;
+    size_t column, line;
     union {
         const char *error;
         struct { size_t value; Token t; } boolean;
         struct { long long value; Token t; } number;
-        Token string;
-        Token var;
-        NodeList array_lit;
+        struct { Token value; } string;
+        struct { Token ident; Symbol *resolved; } ident_;
+        Token t_builtin;
+        Token t_ident;
+        struct { NodeList elems; } array_lit;
         struct { Token op; Node *expr; } unary;
         struct { Node *cast_type; Node *expr; } cast;
         struct { Token op; Node *lhs; Node *rhs; } binary;
-        struct { Node *called; NodeList args; } call;
+        struct { Node *called; NodeList args; Symbol *resolved_fn; } call;
         struct { Node *array; Node *index; } index_;
-        struct { Node *strc; Node *var; } field;
+        struct { Node *type; Node *length; } t_array;
+        struct { Node *strc; Node *ident; } field;
         struct { Node *cond; Node *stmt; } while_loop;
         Node *return_stmt;
         struct { Node *cond; Node *stmt; Node *else_chain; } if_stmt;
-        struct { bool is_const; Node *type; Token name; Node *rvalue; } declexpr;
+        struct { bool is_const; Node *type; Token name; Node *rvalue; Symbol *sym; } declexpr;
         struct { Node *lvalue; Node *rvalue; } assign;
         Node *expr_stmt;
         NodeList stmts;
         struct { NodeList init; Node *expr; NodeList step; Node *stmt; } for_stmt;
         struct { Node *ret_type; Token name; NodeList params; Node *stmt; } fn;
-        struct { Node *p_type; Token name; } param;
+        struct { Node *p_type; Token name; Symbol *sym; } param;
         struct { Token name; NodeList fields; } struct_;
         struct { Token name; Node *type; } stc_field;
         NodeList program;
