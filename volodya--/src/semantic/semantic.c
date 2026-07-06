@@ -1,15 +1,15 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdint.h>
-#include "semantic.h"
-#include "../parser/parser.h"
-#include "../lexer/lexer.h"
 #include <stdarg.h>
 #include <limits.h>
 
-#define SEM_ERR_LIMIT 10
+#include "../parser/parser.h"
+#include "semantic.h"
+
+#define SEM_ERR_LIMIT 16
 #define SEM_ERR_MSG_MAX 256
+#define MAX_DEPTH 256
 
 typedef struct {
     size_t line, column;
@@ -19,34 +19,14 @@ typedef struct {
 } SemErr;
 
 typedef struct {
-    const char *start_pos;
-    size_t length;
-    Type *type;
-} StructField;
-
-typedef struct {
-    const char *start_pos;
-    size_t length;
-    StructField **fields;
-    size_t nfields;
-} StructDef;
-
-typedef struct {
-    size_t length, cap;
-    StructDef **table;
-} StructTable;
-
-typedef struct {
     StructTable table;
     const char *path;
     Scope *root;
     Type *current_ret;
     SemErr *errs;
     size_t nerrs, cap;
-
     size_t total_reports;
-    size_t dropped_dupes;
-    size_t dropped_limit;
+    size_t dropped_dupes, dropped_limit;
 } SCtx;
 
 typedef struct {
@@ -88,7 +68,7 @@ static void sem_error(SCtx *ctx, size_t line, size_t column, const char *start_p
         }
     }
 
-    if (ctx->nerrs >= SEM_ERR_LIMIT) {
+    if (ctx->nerrs > SEM_ERR_LIMIT) {
         ctx->dropped_limit++;
         return;
     }
@@ -107,7 +87,6 @@ static void sem_error(SCtx *ctx, size_t line, size_t column, const char *start_p
     if (pos < ctx->nerrs) {
         memmove(&ctx->errs[pos + 1], &ctx->errs[pos], (ctx->nerrs - pos) * sizeof(SemErr));
     }
-
     ctx->errs[pos] = cand;
     ctx->nerrs++;
 }
@@ -137,15 +116,8 @@ static void sem_flush_errors(SCtx *ctx) {
     }
 }
 
-static void sem_free(SCtx *ctx) {
-    if (!ctx) return;
-    free(ctx->errs);
-    ctx->errs = NULL;
-    ctx->nerrs = ctx->cap = 0;
-}
-
 static inline bool sem_too_many(const SCtx *ctx) {
-    return ctx && ctx->nerrs >= SEM_ERR_LIMIT;
+    return ctx && ctx->nerrs > SEM_ERR_LIMIT;
 }
 
 static int type_eq(const Type *a, const Type *b) {
@@ -154,15 +126,26 @@ static int type_eq(const Type *a, const Type *b) {
     if (a->kind != b->kind) return 0;
 
     switch (a->kind) {
-        case T_VOLOID: case T_BOOL: case T_I32: case T_I64: case T_U32: case T_U64: case T_STRING: return 1;
-        case T_STRUCT: return a->struct_.length == b->struct_.length && !strncmp(a->struct_.start_pos, b->struct_.start_pos, a->struct_.length);
-        case T_ARRAY: return type_eq(a->array.elem, b->array.elem);
-        case T_FN:
+        case T_VOLOID: case T_BOOL: case T_I32: case T_I64: case T_U32: case T_U64: return 1;
+        case T_STRUCT:{
+            return a->struct_.length == b->struct_.length && !strncmp(a->struct_.start_pos, b->struct_.start_pos, a->struct_.length);
+        }
+        case T_ARRAY:{
+            if (!type_eq(a->array.elem, b->array.elem)) return 0;
+            if (a->array.length == -1 || b->array.length == -1) return 1;
+            return a->array.length == b->array.length;
+        }
+        case T_STRING:{
+            if (a->string.length_bytes == -1 || b->string.length_bytes == -1) return 1;
+            return a->string.length_bytes == b->string.length_bytes;
+        }
+        case T_FN:{
             if (a->fn.nparams != b->fn.nparams || !type_eq(a->fn.ret, b->fn.ret)) return 0;
             for (size_t i = 0; i < a->fn.nparams; ++i) {
                 if (!type_eq(a->fn.params[i], b->fn.params[i])) return 0;
             }
             return 1;
+        }
         default: return 0;
     }
 }
@@ -173,6 +156,7 @@ static inline int is_bool(const Type *t) { return t->kind == T_BOOL; }
 static inline int is_voloid(const Type *t) { return t->kind == T_VOLOID; }
 static inline int is_array(const Type *t) { return t->kind == T_ARRAY; }
 static inline int is_struct(const Type *t) { return t->kind == T_STRUCT; }
+static inline int is_string(const Type *t) { return t->kind == T_STRING; }
 
 static int can_cast_explicit(const Type *dst, const Type *src) {
     return is_int(src) && is_int(dst);
@@ -200,11 +184,30 @@ static Type *mk_type_fn(Type **params, size_t nparams, Type *ret) {
     return t;
 }
 
-static Type *mk_type_struct(const char *start_pos, size_t length) {
+static Type *mk_type_struct(const char *start_pos, size_t length, Node *decl) {
     Type *t = mk_type(T_STRUCT);
     t->struct_.start_pos = start_pos;
     t->struct_.length = length;
+    t->struct_.struct_decl = decl;
     return t;
+}
+
+static Type *mk_type_string(size_t length) {
+    Type *t = mk_type(T_STRING);
+    t->string.length_bytes = (int32_t)length;
+    return t;
+}
+
+static Type *mk_type_from_kw(TokenType tok) {
+    switch (tok) {
+        case TOK_KW_I32: return mk_type(T_I32);
+        case TOK_KW_I64: return mk_type(T_I64);
+        case TOK_KW_U32: return mk_type(T_U32);
+        case TOK_KW_U64: return mk_type(T_U64);
+        case TOK_KW_BOOL: return mk_type(T_BOOL);
+        case TOK_KW_VOLOID: return mk_type(T_VOLOID);
+        default: return NULL;
+    }
 }
 
 static Symbol *mk_symbol(SymKind kind) {
@@ -245,7 +248,7 @@ static Symbol *mk_symbol_var(size_t column, size_t line, Type *type, const char 
     return sym;
 }
 
-static Symbol *mk_symbol_fn(size_t column, size_t line, Type *type, const char *start_pos, size_t length, FnState fn_state) {
+static Symbol *mk_symbol_fn(size_t column, size_t line, Type *type, const char *start_pos, size_t length, FnState fn_state, BuiltInKind bi) {
     Symbol *sym = mk_symbol(SYM_FN);
     sym->type = type;
     sym->column = column;
@@ -253,6 +256,7 @@ static Symbol *mk_symbol_fn(size_t column, size_t line, Type *type, const char *
     sym->start_pos = start_pos;
     sym->length = length;
     sym->fn_state = fn_state;
+    sym->bi_kind = bi;
     return sym;
 }
 
@@ -309,38 +313,38 @@ static void sym_insert(Scope *s, Symbol *new_sym, SCtx *ctx) {
             "'%.*s' is already defined", (int)new_sym->length, new_sym->start_pos);
 }
 
-static inline Type *mk_type_from_kw(TokenType tok) {
-    Type *t;
-    switch (tok) {
-        case TOK_KW_I32: t = mk_type(T_I32); break;
-        case TOK_KW_I64: t = mk_type(T_I64); break;
-        case TOK_KW_U32: t = mk_type(T_U32); break;
-        case TOK_KW_U64: t = mk_type(T_U64); break;
-        case TOK_KW_BOOL: t = mk_type(T_BOOL); break;
-        case TOK_KW_STRING: t = mk_type(T_STRING); break;
-        case TOK_KW_VOLOID: t = mk_type(T_VOLOID); break;
-        default: t = NULL;
-    }
-    return t;
-}
-
 static Type *type_res(Node *node, Scope *s, SCtx *ctx) {
     switch (node->kind) {
         case NK_T_BUILTIN: return mk_type_from_kw(node->t_builtin.type);
-        case NK_T_IDENT:
-            Symbol *sym = sym_lookup(s, node->t_ident.start_pos, node->t_ident.length);
-            if (sym && sym->kind == SYM_STRUCT)
-                return mk_type_struct(node->t_ident.start_pos, node->t_ident.length);
-            else
-                sem_error(ctx, node->line, node->column,
-                NULL, 0, "'%.*s' is of unknown type", (int)node->t_ident.length, node->t_ident.start_pos);
-            
-            return NULL;
-        case NK_T_ARRAY:{
-            return mk_type_array(type_res(node->t_array.type, s, ctx), -1);
+        case NK_T_STRING:{
+            size_t length = node->t_string.length->number.value;
+            if (length != 0) {
+                return mk_type_string(length);
+            }
+            sem_error(ctx, node->line, node->column, NULL, 0, "size of a string has to be a non-zero numeric literal");
+            break;
         }
-        default: return NULL;
+        case NK_T_IDENT:{
+            Symbol *sym = sym_lookup(s, node->t_ident.start_pos, node->t_ident.length);
+            if (sym && sym->kind == SYM_STRUCT) {
+                return mk_type_struct(node->t_ident.start_pos, node->t_ident.length, sym->type->struct_.struct_decl);
+            } else {
+                sem_error(ctx, node->line, node->column,
+                    NULL, 0, "'%.*s' is of unknown type", (int)node->t_ident.length, node->t_ident.start_pos);
+                break;
+            }
+        }
+        case NK_T_ARRAY:{ // length == -1 is encoded through parser sentinel for unsized array forms
+            size_t length = node->t_array.length->number.value;
+            if (length != 0) {
+                return mk_type_array(type_res(node->t_array.type, s, ctx), (int32_t)length);
+            }
+            sem_error(ctx, node->line, node->column, NULL, 0, "size of an array has to be a non-zero numeric literal");
+            break;
+        }
+        default: break;
     }
+    return NULL;
 }
 
 static Type **mk_param_t_list(Node *node, Scope *s, SCtx *ctx) {
@@ -361,11 +365,12 @@ static void add_structdef(StructTable *table, StructDef *def) {
     table->table[table->length++] = def;
 }
 
-static StructField *mk_struct_field(const char *start_pos, size_t length, Type *t) {
+static StructField *mk_struct_field(const char *start_pos, size_t length, Type *t, Node *n) {
     StructField *f = malloc(sizeof(StructField));
     f->start_pos = start_pos;
     f->length = length;
     f->type = t;
+    f->field_decl = n;
     return f;
 }
 
@@ -380,7 +385,7 @@ static StructDef *mk_struct_def(const char *start_pos, size_t length, StructFiel
 
 static StructField *field_lookup(size_t index, StructField **f, const char *start_pos, size_t length) {
     for (size_t i = 0; i < index; ++i)
-        if (f[i]->length == length && !strncmp(f[i]->start_pos, start_pos, length)) return f[i];
+        if (f[i] && f[i]->length == length && !strncmp(f[i]->start_pos, start_pos, length)) return f[i];
     return NULL;
 }
 
@@ -396,11 +401,12 @@ static void resolve_struct(Node *node, Scope *s, SCtx *ctx) {
     StructField **fields = malloc(sizeof(StructField *) * nf);
 
     for (size_t i = 0; i < nf; ++i) {
-        Token name = node->struct_.fields.data[i]->stc_field.name;
-        Type *t = type_res(node->struct_.fields.data[i]->stc_field.type, s, ctx);
-        node->struct_.fields.data[i]->type = t;
+        Node *field = node->struct_.fields.data[i];
+        Token name = field->stc_field.name;
+        Type *t = type_res(field->stc_field.type, s, ctx);
+        field->type = t;
 
-        if (is_struct(t) && (t->struct_.length == node->struct_.name.length &&
+        if (t && is_struct(t) && (t->struct_.length == node->struct_.name.length &&
         !strncmp(t->struct_.start_pos, node->struct_.name.start_pos, t->struct_.length))) {
             sem_error(ctx, name.line, name.column, NULL, 0,
                 "recursive field '%.*s' must be a pointer, but pointers are not supported", (int)name.length, name.start_pos);
@@ -408,8 +414,9 @@ static void resolve_struct(Node *node, Scope *s, SCtx *ctx) {
                 continue;
         }
         StructField *f = field_lookup(i, fields, name.start_pos, name.length);
+
         if (!f) {
-            fields[i] = mk_struct_field(name.start_pos, name.length, t);
+            fields[i] = mk_struct_field(name.start_pos, name.length, t, field);
         } else {
             sem_error(ctx, name.line, name.column, NULL, 0, "field '%.*s' already defined", (int)name.length, name.start_pos);
             fields[i] = NULL;
@@ -421,19 +428,26 @@ static void resolve_struct(Node *node, Scope *s, SCtx *ctx) {
         add_structdef(&ctx->table, mk_struct_def(node->struct_.name.start_pos, node->struct_.name.length, fields, nf));
 }
 
-static void name_res(Node *node, Scope *s, SCtx *ctx) {
+static void name_res(Node *node, Scope *s, SCtx *ctx, int depth) {
     if (sem_too_many(ctx)) return;
     if (!node) return;
+    if (depth >= MAX_DEPTH) exit(EXIT_FAILURE);
     
     switch (node->kind) {
         case NK_PROGRAM:{
             for (size_t i = 0; i < node->program.length; ++i) { 
-                name_res(node->program.data[i], s, ctx); 
+                name_res(node->program.data[i], s, ctx, depth); 
             }
             break;
         }
         case NK_FN:{
             Type *ret = type_res(node->fn.ret_type, s, ctx);
+            
+            if (ret && is_array(ret) && is_voloid(ret->array.elem)) {
+                sem_error(ctx, node->fn.name.line, node->fn.name.column, NULL, 0, "voloid[] as function return type is not allowed");
+                ret = NULL;
+            }
+
             Type **param_list = mk_param_t_list(node, s, ctx);
             size_t nparams = node->fn.params.length;
             Type *fn = mk_type_fn(param_list, nparams, ret);
@@ -445,25 +459,22 @@ static void name_res(Node *node, Scope *s, SCtx *ctx) {
                 fn,
                 node->fn.name.start_pos,
                 node->fn.name.length,
-                !node->fn.stmt ? FN_DECLARED : FN_DEFINED
+                !node->fn.stmt ? FN_DECLARED : FN_DEFINED,
+                BUILTIN_NONE
             );
-            
-            if (is_array(ret) && is_voloid(ret->array.elem)) {
-                sem_error(ctx, sym->line, sym->column, NULL, 0, "voloid[] as function return type is not allowed");
-                break;
-            }
+
             sym_insert(s, sym, ctx);
             Scope *new_s = scope_push(s);
             for (size_t i = 0; i < nparams; ++i) {
-                name_res(node->fn.params.data[i], new_s, ctx);
+                name_res(node->fn.params.data[i], new_s, ctx, depth);
             }
-            name_res(node->fn.stmt, new_s, ctx);
+            name_res(node->fn.stmt, new_s, ctx, depth + 1);
             scope_pop(new_s);
             break;
         }
         case NK_PARAM:{
             Token name = node->param.name;
-            name_res(node->param.p_type, s, ctx);
+            name_res(node->param.p_type, s, ctx, depth);
             Type *t = type_res(node->param.p_type, s, ctx);
             node->type = t;
 
@@ -474,34 +485,34 @@ static void name_res(Node *node, Scope *s, SCtx *ctx) {
         }
         case NK_BLOCK:{
             Scope *new_s = scope_push(s);
-            for (size_t i = 0; i < node->stmts.length; ++i) name_res(node->stmts.data[i], new_s, ctx);
+            for (size_t i = 0; i < node->stmts.length; ++i) name_res(node->stmts.data[i], new_s, ctx, depth + 1);
             scope_pop(new_s);
             break;
         }
         case NK_IF:{
             Scope *new_s = scope_push(s);
-            name_res(node->if_stmt.cond, new_s, ctx);
-            name_res(node->if_stmt.stmt, new_s, ctx);
+            name_res(node->if_stmt.cond, new_s, ctx, depth);
+            name_res(node->if_stmt.stmt, new_s, ctx, depth + 1);
             scope_pop(new_s);
             
             Scope *else_s = scope_push(s);
-            name_res(node->if_stmt.else_chain, else_s, ctx);
+            name_res(node->if_stmt.else_chain, else_s, ctx, depth + 1);
             scope_pop(else_s);
             break;
         }
         case NK_WHILE:{
             Scope *new_s = scope_push(s);
-            name_res(node->while_loop.cond, new_s, ctx);
-            name_res(node->while_loop.stmt, new_s, ctx);
+            name_res(node->while_loop.cond, new_s, ctx, depth);
+            name_res(node->while_loop.stmt, new_s, ctx, depth + 1);
             scope_pop(new_s);
             break;
         }
         case NK_FOR:{
             Scope* new_s = scope_push(s);
-            for (size_t i = 0; i < node->for_stmt.init.length; ++i) name_res(node->for_stmt.init.data[i], new_s, ctx);
-            name_res(node->for_stmt.expr, new_s, ctx);
-            for (size_t i = 0; i < node->for_stmt.step.length; ++i) name_res(node->for_stmt.step.data[i], new_s, ctx);
-            name_res(node->for_stmt.stmt, new_s, ctx);
+            for (size_t i = 0; i < node->for_stmt.init.length; ++i) name_res(node->for_stmt.init.data[i], new_s, ctx, depth);
+            name_res(node->for_stmt.expr, new_s, ctx, depth);
+            for (size_t i = 0; i < node->for_stmt.step.length; ++i) name_res(node->for_stmt.step.data[i], new_s, ctx, depth);
+            name_res(node->for_stmt.stmt, new_s, ctx, depth + 1);
             scope_pop(new_s);
             break;
         }
@@ -510,7 +521,7 @@ static void name_res(Node *node, Scope *s, SCtx *ctx) {
             const char *start_pos = node->declexpr.name.start_pos;
             size_t length = node->declexpr.name.length;
             
-            name_res(node->declexpr.type, s, ctx);
+            name_res(node->declexpr.type, s, ctx, depth);
             Type *t = type_res(node->declexpr.type, s, ctx);
             node->type = t;
 
@@ -521,7 +532,7 @@ static void name_res(Node *node, Scope *s, SCtx *ctx) {
                 sem_error(ctx, line, column, NULL, 0,
                     "cosntant variable '%.*s' must be initialized at declaration", (int)length, start_pos);
             
-            if (node->declexpr.rvalue) name_res(node->declexpr.rvalue, s, ctx);
+            if (node->declexpr.rvalue) name_res(node->declexpr.rvalue, s, ctx, depth);
             sym_insert(s, sym, ctx);
             node->declexpr.sym = sym;
             break;
@@ -531,7 +542,7 @@ static void name_res(Node *node, Scope *s, SCtx *ctx) {
             Symbol *sym = mk_symbol_struct(
                 struct_name.column,
                 struct_name.line,
-                mk_type_struct(struct_name.start_pos, struct_name.length),
+                mk_type_struct(struct_name.start_pos, struct_name.length, node),
                 struct_name.start_pos,
                 struct_name.length
             );
@@ -541,50 +552,55 @@ static void name_res(Node *node, Scope *s, SCtx *ctx) {
             break;
         }
         case NK_ASSIGN:{
-            name_res(node->assign.lvalue, s, ctx);
-            name_res(node->assign.rvalue, s, ctx);
+            name_res(node->assign.lvalue, s, ctx, depth);
+            name_res(node->assign.rvalue, s, ctx, depth);
             break;
         }
         case NK_RETURN:{
-            name_res(node->return_stmt, s, ctx);
+            name_res(node->return_stmt, s, ctx, depth);
             break;
         }
         case NK_EXPR:{
-            name_res(node->expr_stmt, s, ctx);
+            name_res(node->expr_stmt, s, ctx, depth);
             break;    
         }
         case NK_ARRAY_LIT:{
             for (size_t i = 0; i < node->array_lit.elems.length; ++i) {
-                name_res(node->array_lit.elems.data[i], s, ctx);
+                name_res(node->array_lit.elems.data[i], s, ctx, depth);
             }
             break;
         }
         case NK_FIELD:{
-            name_res(node->field.strc, s, ctx);
+            name_res(node->field.strc, s, ctx, depth);
             break;
         }
         case NK_T_ARRAY:{
-            name_res(node->t_array.length, s, ctx);
+            name_res(node->t_array.length, s, ctx, depth);
             break;
         }
         case NK_BINARY:{
-            name_res(node->binary.lhs, s, ctx);
-            name_res(node->binary.rhs, s, ctx);
+            name_res(node->binary.lhs, s, ctx, depth);
+            name_res(node->binary.rhs, s, ctx, depth);
+            break;
+        }
+        case NK_CAST:{
+            name_res(node->cast.expr, s, ctx, depth);
             break;
         }
         case NK_UNARY:{
-            name_res(node->unary.expr, s, ctx);
+            name_res(node->unary.expr, s, ctx, depth);
             break;
         }
         case NK_CALL:{
-            name_res(node->call.called, s, ctx);
-            for (size_t i = 0; i < node->call.args.length; ++i)
-                name_res(node->call.args.data[i], s, ctx);
-
             Node *callee = node->call.called;
+            name_res(callee, s, ctx, depth);
+            Symbol *sym = callee->ident_.resolved;
+
+            for (size_t i = 0; i < node->call.args.length; ++i) {
+                name_res(node->call.args.data[i], s, ctx, depth);
+            }
 
             if (callee->kind == NK_IDENT) {
-                Symbol *sym = callee->ident_.resolved;
                 if (!sym || sym->kind != SYM_FN) {
                     sem_error(ctx, callee->line, callee->column, NULL, 0, "called expression is not a function");
                 } else {
@@ -600,8 +616,8 @@ static void name_res(Node *node, Scope *s, SCtx *ctx) {
             break;
         }
         case NK_INDEX:{
-            name_res(node->index_.index, s, ctx);
-            name_res(node->index_.array, s, ctx);
+            name_res(node->index_.index, s, ctx, depth);
+            name_res(node->index_.array, s, ctx, depth);
             break;
         }
         case NK_IDENT:{
@@ -621,9 +637,168 @@ static void name_res(Node *node, Scope *s, SCtx *ctx) {
     }
 }
 
+static bool falls_through(Node *stmt);
+
+static bool can_break(Node *stmt) {
+    if (!stmt) return false;
+
+    switch (stmt->kind) {
+        case NK_IF:{
+            int is_cond = -1;
+            if (stmt->if_stmt.cond->kind == NK_BOOLEAN) is_cond = (int)stmt->if_stmt.cond->boolean.value;
+            
+            switch (is_cond) {
+                case 1: return can_break(stmt->if_stmt.stmt);
+                case 0:
+                    if (!stmt->if_stmt.else_chain) return false;
+                    else return can_break(stmt->if_stmt.else_chain);
+                default:
+                    if (can_break(stmt->if_stmt.stmt) || can_break(stmt->if_stmt.else_chain)) return true;
+                    return false;
+            }
+        }
+        case NK_BLOCK:{
+            for (size_t i = 0; i < stmt->stmts.length; ++i) {
+                if (can_break(stmt->stmts.data[i])) return true;
+                if (!falls_through(stmt->stmts.data[i])) break;
+            }
+            return false;
+        }
+        case NK_BREAK: return true;
+        case NK_RETURN: case NK_FOR:case NK_WHILE: default: return false;
+    }
+}
+
+static bool falls_through(Node *stmt) {
+    if (!stmt) return true;
+
+    switch (stmt->kind) {
+        case NK_FOR:{
+            int is_cond = -1;
+            if (!stmt->for_stmt.expr) is_cond = 1;
+            else if (stmt->for_stmt.expr->kind == NK_BOOLEAN) is_cond = (int)stmt->for_stmt.expr->boolean.value;
+
+            if (is_cond == 0 || is_cond == -1) return true;
+            return can_break(stmt->for_stmt.stmt);
+        }
+        case NK_WHILE:{
+            int is_cond = -1;
+            if (stmt->while_loop.cond->kind == NK_BOOLEAN) is_cond = (int)stmt->while_loop.cond->boolean.value;
+
+            if (is_cond == 0 || is_cond == -1) return true;
+            return can_break(stmt->while_loop.stmt);
+        }
+        case NK_IF:{
+            int is_cond = -1;
+            if (stmt->if_stmt.cond->kind == NK_BOOLEAN) is_cond = (int)stmt->if_stmt.cond->boolean.value;
+
+            switch (is_cond) {
+                case 1: return falls_through(stmt->if_stmt.stmt);
+                case 0:
+                    if (!stmt->if_stmt.else_chain) return true;
+                    else return falls_through(stmt->if_stmt.else_chain);
+                default:
+                    if (!falls_through(stmt->if_stmt.stmt) && !falls_through(stmt->if_stmt.else_chain)) return false;
+                    return true;
+            }
+        }
+        case NK_BLOCK:{
+            for (size_t i = 0; i < stmt->stmts.length; ++i) { 
+                if (!falls_through(stmt->stmts.data[i])) return false;
+            }
+            return true;
+        }
+        case NK_BREAK: case NK_RETURN: return false; 
+        default: return true;
+    }
+}
+
 static inline Type *ann(Node *n, Type *t, bool is_lval) { n->type = t; n->is_lvalue = is_lval; return t; }
 
-static const char *type_kind[T__COUNT] = {"voloid", "bool", "i32", "i64", "u32", "u64", "string", "array", "struct", "fn"};
+static Type *check_expr(Node *expr, SCtx *ctx);
+
+static const char *type_to_string(Type *t) {
+    static char bufs[8][256];
+    static size_t idx = 0;
+
+    char *buf = bufs[idx++ % 8];
+    buf[0] = '\0';
+
+    if (!t) {
+        snprintf(buf, 256, "<null-type>");
+        return buf;
+    }
+
+    switch (t->kind) {
+        case T_VOLOID: snprintf(buf, 256, "voloid"); break;
+        case T_BOOL:   snprintf(buf, 256, "bool");   break;
+        case T_I32:    snprintf(buf, 256, "i32");    break;
+        case T_I64:    snprintf(buf, 256, "i64");    break;
+        case T_U32:    snprintf(buf, 256, "u32");    break;
+        case T_U64:    snprintf(buf, 256, "u64");    break;
+
+        case T_STRUCT:
+            snprintf(buf, 256, "%.*s",
+                (int)t->struct_.length,
+                t->struct_.start_pos);
+            break;
+
+        case T_STRING: {
+            int32_t n = t->string.length_bytes;
+            if (n == -1) {
+                snprintf(buf, 256, "string[any]");
+            } else {
+                snprintf(buf, 256, "string[%d]", n);
+            }
+            break;
+        }
+
+        case T_ARRAY: {
+            const char *elem = type_to_string(t->array.elem);
+            int32_t n = t->array.length;
+            if (n == -1) {
+                snprintf(buf, 256, "%s[any]", elem);
+            } else {
+                snprintf(buf, 256, "%s[%d]", elem, n);
+            }
+            break;
+        }
+
+        case T_FN:
+            snprintf(buf, 256, "<fn>");
+            break;
+
+        default:
+            snprintf(buf, 256, "<unknown-type>");
+            break;
+    }
+
+    return buf;
+}
+
+static void check_type_length_expr(Node *n, SCtx *ctx, size_t line, size_t column) {
+    if (!n) return;
+
+    Node *len = NULL;
+    const char *what = NULL;
+    
+    if (n->kind == NK_T_ARRAY) {
+        len = n->t_array.length;
+        what = "array";
+    } else if (n->kind == NK_T_STRING) {
+        len = n->t_string.length;
+        what = "string";
+    } else {
+        return;
+    }
+
+    Type *tl = check_expr(len, ctx);
+    if (tl && tl->kind != T_I32) {
+        sem_error(ctx, line, column, NULL, 0,
+            "%s length must be of type 'i32' (have '%s')",
+            what, type_to_string(tl));
+    }
+}
 
 static Type *check_expr(Node *expr, SCtx *ctx) {
     if (sem_too_many(ctx)) return NULL;
@@ -653,10 +828,10 @@ static Type *check_expr(Node *expr, SCtx *ctx) {
             }
             if (is_both_int && !type_eq(lhs, rhs)) {
                 sem_error(ctx, expr->line, expr->column, NULL, 0, "expected same numeric types for %.*s (have '%s' and '%s')",
-                    (int)expr->binary.op.length, expr->binary.op.start_pos, type_kind[lhs->kind],  type_kind[rhs->kind]);
+                    (int)expr->binary.op.length, expr->binary.op.start_pos, type_to_string(lhs),  type_to_string(rhs));
             } else {
                 sem_error(ctx, expr->line, expr->column, NULL, 0, "invalid operands to %.*s (have '%s' and '%s')",
-                    (int)expr->binary.op.length, expr->binary.op.start_pos, type_kind[lhs->kind],  type_kind[rhs->kind]);
+                    (int)expr->binary.op.length, expr->binary.op.start_pos, type_to_string(lhs),  type_to_string(rhs));
             }
             return ann(expr, NULL, false);
         }
@@ -674,7 +849,7 @@ static Type *check_expr(Node *expr, SCtx *ctx) {
             }
             if (!can_cast_explicit(cast_type, cast_expr)) {
                 sem_error(ctx, expr->line, expr->column, NULL, 0, "cannot cast from %s to %s",
-                    type_kind[cast_expr->kind], type_kind[cast_type->kind]);
+                    type_to_string(cast_expr),  type_to_string(cast_type));
                 return ann(expr, NULL, false);
             }
             return ann(expr, cast_type, false);
@@ -685,10 +860,10 @@ static Type *check_expr(Node *expr, SCtx *ctx) {
             Token tok = expr->unary.op;
 
             if ((tok.type == TOK_MINUS || tok.type == TOK_PLUS) && !is_signed_int(t)) {
-                sem_error(ctx, expr->line, expr->column, NULL, 0, "invalid operand to %c (have '%s')", *(tok.start_pos), type_kind[t->kind]);
+                sem_error(ctx, expr->line, expr->column, NULL, 0, "invalid operand to %c (have '%s')", *(tok.start_pos), type_to_string(t));
                 return ann(expr, NULL, false);
             } else if (tok.type == TOK_NOT && !is_bool(t)) {
-                sem_error(ctx, expr->line, expr->column, NULL, 0, "invalid operand to %c (have '%s')", *(tok.start_pos), type_kind[t->kind]);
+                sem_error(ctx, expr->line, expr->column, NULL, 0, "invalid operand to %c (have '%s')", *(tok.start_pos), type_to_string(t));
                 return ann(expr, NULL, false);
             }
             return ann(expr, t, false);
@@ -698,36 +873,55 @@ static Type *check_expr(Node *expr, SCtx *ctx) {
             Type *ti = check_expr(expr->index_.index, ctx);
             if (!ti || !ta) return ann(expr, NULL, false);
 
-            if (!is_array(ta)) {
-                sem_error(ctx, expr->index_.array->line, expr->index_.array->column, NULL, 0, "indexing non-array");
+            if (!is_array(ta) && !is_string(ta)) {
+                sem_error(ctx, expr->index_.array->line, expr->index_.array->column, NULL, 0, "indexing requires array or string type");
                 return ann(expr, NULL, false);
             }
             if (ti->kind != T_I32) {
                 sem_error(ctx, expr->index_.index->line, expr->index_.index->column, NULL, 0,
-                    "type 'i32' is expected, but '%s' was provided", type_kind[ti->kind]);
+                    "type 'i32' is expected, but '%s' was provided", type_to_string(ti));
                 return ann(expr, NULL, false);
             }
-            return ann(expr, ta->array.elem, expr->index_.array->is_lvalue);
+            return ann(expr, is_string(ta) ? mk_type(T_U32) : ta->array.elem, expr->index_.array->is_lvalue);
         }
         case NK_CALL:{
             Symbol *sym = expr->call.resolved_fn;
             if (!sym) return ann(expr, NULL, false);
+            
+            size_t args_len = expr->call.args.length;
 
-            if (expr->call.args.length != sym->type->fn.nparams) {
+            if (sym->bi_kind == BUILTIN_NONE && args_len != sym->type->fn.nparams) {
                 sem_error(ctx, expr->call.called->line, expr->call.called->column, NULL, 0,
-                    "funcion '%.*s' expectes %zu arguments, but %zu were provided",
-                    (int)sym->length, sym->start_pos, sym->type->fn.nparams, expr->call.args.length);
+                    "funcion '%.*s' expects %zu arguments, but %zu were provided",
+                    (int)sym->length, sym->start_pos, sym->type->fn.nparams, args_len);
 
                 return ann(expr, NULL, false);
+            } else if (sym->bi_kind == BUILTIN_PRINT) {
+                if (args_len == 0) {
+                    sem_error(ctx, expr->line, expr->column, NULL, 0, "funcion 'print' expects at least 1 parameter");
+                }
+                for (size_t i = 0; i < args_len; ++i) {
+                    Type *t = check_expr(expr->call.args.data[i], ctx);
+                    if (!t) return ann(expr, NULL, false);
+
+                    if (!type_eq(t, mk_type_string((size_t)-1))) {
+                        sem_error(ctx, expr->call.args.data[i]->line, expr->call.args.data[i]->column, NULL, 0,
+                            "funcion 'print' expects parameter of type 'string', but type '%s' was provided",
+                            type_to_string(expr->call.args.data[i]->type));
+                        return ann(expr, NULL, false);
+                    }
+                }
             } else {
-                for (size_t i = 0; i < expr->call.args.length; ++i) {
+                for (size_t i = 0; i < args_len; ++i) {
                     Type *t = check_expr(expr->call.args.data[i], ctx);
                     if (!t) return ann(expr, NULL, false);
 
                     if (!type_eq(t, sym->type->fn.params[i])) {
                         sem_error(ctx, expr->call.args.data[i]->line, expr->call.args.data[i]->column, NULL, 0,
-                            "funcion '%.*s' expectes parameter of type '%s', but type '%s' was provided",
-                            (int)sym->length, sym->start_pos, type_kind[sym->type->fn.params[i]->kind], type_kind[expr->call.args.data[i]->type->kind]);
+                            "funcion '%.*s' expects parameter of type '%s', but type '%s' was provided",
+                            (int)sym->length, sym->start_pos,
+                            type_to_string(sym->type->fn.params[i]),
+                            type_to_string(expr->call.args.data[i]->type));
                         return ann(expr, NULL, false);
                     }
                 }
@@ -737,7 +931,7 @@ static Type *check_expr(Node *expr, SCtx *ctx) {
         case NK_FIELD:{
             Type *t = check_expr(expr->field.strc, ctx);
             if (!t) return ann(expr, NULL, false);
-
+    
             if (!is_struct(t)) {
                 sem_error(ctx, expr->line, expr->column, NULL, 0, "left of '.' is not a struct");
                 return ann(expr, NULL, false);
@@ -753,6 +947,7 @@ static Type *check_expr(Node *expr, SCtx *ctx) {
                     "'%.*s' is not a field of a struct", (int)tok.length, tok.start_pos);
                 return ann(expr, NULL, false);    
             }
+            expr->field.field_decl = f;
             return ann(expr, f->type, expr->field.strc->is_lvalue);
         }
         case NK_ARRAY_LIT:{
@@ -773,7 +968,7 @@ static Type *check_expr(Node *expr, SCtx *ctx) {
                 if (!type_eq(elem_type, t)) {
                     sem_error(ctx, expr->line, expr->column, NULL, 0, 
                         "array literal consists of different types (position %zu is of type '%s' but expected '%s')",
-                        i + 1, type_kind[t->kind], type_kind[elem_type->kind]);
+                        i + 1, type_to_string(t), type_to_string(elem_type));
                     return ann(expr, NULL, false);
                 }
             }
@@ -786,94 +981,20 @@ static Type *check_expr(Node *expr, SCtx *ctx) {
             return ann(expr, sym->type, sym->kind == SYM_VAR);
         }
         case NK_NUMBER:{
-            unsigned long long v = (unsigned long long)expr->number.value;
-            if (v <= INT_MAX || v == 0x8000'0000)
+            unsigned long long v = expr->number.value;
+            if (v <= INT_MAX)
                 return ann(expr, mk_type(T_I32), false);
-            else if (v <= LLONG_MAX || v == 0x8000'0000'0000'0000)
+            else if (v <= LLONG_MAX || v == 0x8000'0000)
                 return ann(expr, mk_type(T_I64), false);
             
             return ann(expr, mk_type(T_U64), false);
         }
+        case NK_STRING_LIT:{
+            size_t length = expr->string_lit.value.lit_length_bytes;
+            return ann(expr, mk_type_string(length), false);
+        }
         case NK_BOOLEAN: return ann(expr, mk_type(T_BOOL), false);
-        case NK_STRING: return ann(expr, mk_type(T_STRING), false);
         default: return NULL;
-    }
-}
-
-static bool falls_through(Node *stmt);
-
-static bool can_break(Node *stmt) {
-    if (!stmt) return false;
-
-    switch (stmt->kind) {
-        case NK_IF:{
-            int is_cond = -1;
-            if (stmt->if_stmt.cond->kind == NK_BOOLEAN) is_cond = stmt->if_stmt.cond->boolean.value;
-            
-            switch (is_cond) {
-                case 1: return can_break(stmt->if_stmt.stmt);
-                case 0:
-                    if (!stmt->if_stmt.else_chain) return false;
-                    else return can_break(stmt->if_stmt.else_chain);
-                case -1:
-                    if (can_break(stmt->if_stmt.stmt) || can_break(stmt->if_stmt.else_chain)) return true;
-                    return false;
-            }
-        }
-        case NK_BLOCK:{
-            for (size_t i = 0; i < stmt->stmts.length; ++i) {
-                if (can_break(stmt->stmts.data[i])) return true;
-                if (!falls_through(stmt->stmts.data[i])) break;
-            }
-            return false;
-        }
-        case NK_BREAK: return true;
-        case NK_RETURN: case NK_FOR: case NK_WHILE: return false;
-        default: return false;
-    }
-}
-
-static bool falls_through(Node *stmt) {
-    if (!stmt) return true;
-
-    switch (stmt->kind) {
-        case NK_FOR:{
-            int is_cond = -1;
-            if (!stmt->for_stmt.expr) is_cond = 1;
-            else if (stmt->for_stmt.expr->kind == NK_BOOLEAN) is_cond = stmt->for_stmt.expr->boolean.value;
-
-            if (is_cond == 0 || is_cond == -1) return true;
-            return can_break(stmt->for_stmt.stmt);
-        }
-        case NK_WHILE:{
-            int is_cond = -1;
-            if (stmt->while_loop.cond->kind == NK_BOOLEAN) is_cond = stmt->while_loop.cond->boolean.value;
-
-            if (is_cond == 0 || is_cond == -1) return true;
-            return can_break(stmt->while_loop.stmt);
-        }
-        case NK_IF:{
-            int is_cond = -1;
-            if (stmt->if_stmt.cond->kind == NK_BOOLEAN) is_cond = stmt->if_stmt.cond->boolean.value;
-
-            switch (is_cond) {
-                case 1: return falls_through(stmt->if_stmt.stmt);
-                case 0:
-                    if (!stmt->if_stmt.else_chain) return true;
-                    else return falls_through(stmt->if_stmt.else_chain);
-                case -1:
-                    if (!falls_through(stmt->if_stmt.stmt) && !falls_through(stmt->if_stmt.else_chain)) return false;
-                    return true;
-            }
-        }
-        case NK_BLOCK:{
-            for (size_t i = 0; i < stmt->stmts.length; ++i) { 
-                if (!falls_through(stmt->stmts.data[i])) return false;
-            }
-            return true;
-        }
-        case NK_BREAK: case NK_RETURN: return false; 
-        default: return true;
     }
 }
 
@@ -887,7 +1008,7 @@ static void check_stmt(Node *node, SCtx *ctx, int loop_depth) {
 
             if (t && !is_bool(t)) {
                 sem_error(ctx, node->while_loop.cond->line, node->while_loop.cond->column, NULL, 0,
-                    "condition must be of type 'bool' (have '%s')", type_kind[t->kind]);
+                    "condition must be of type 'bool' (have '%s')", type_to_string(t));
             }
             check_stmt(node->while_loop.stmt, ctx, loop_depth + 1);
             break;
@@ -909,7 +1030,7 @@ static void check_stmt(Node *node, SCtx *ctx, int loop_depth) {
                     sem_error(ctx, node->line, node->column, NULL, 0, "voloid function cannot return a value");
                 } else if (fn_ret && t && !type_eq(t, fn_ret)) {
                     sem_error(ctx, node->line, node->column, NULL, 0,
-                        "return type mismatch (have '%s', expected '%s')", type_kind[t->kind], type_kind[fn_ret->kind]);
+                        "return type mismatch (have '%s', expected '%s')", type_to_string(t), type_to_string(fn_ret));
                 }
             }
             break;
@@ -919,39 +1040,20 @@ static void check_stmt(Node *node, SCtx *ctx, int loop_depth) {
 
             if (t && !is_bool(t)) {
                 sem_error(ctx, node->if_stmt.cond->line, node->if_stmt.cond->column, NULL, 0,
-                    "condition must be of type 'bool' (have '%s')", type_kind[t->kind]);
+                    "condition must be of type 'bool' (have '%s')", type_to_string(t));
             }
             check_stmt(node->if_stmt.stmt, ctx, loop_depth);
             check_stmt(node->if_stmt.else_chain, ctx, loop_depth);
             break;
         }
-        case NK_DECLEXPR: {
-            if (node->type && node->type->kind == T_ARRAY) {
-                Node *len = node->declexpr.type->t_array.length;
-                Type *tl = check_expr(len, ctx);
-                if (tl && tl->kind != T_I32) {
-                    sem_error(ctx, len->line, len->column, NULL, 0,
-                        "array length must be of type 'i32' (have '%s')", type_kind[tl->kind]);
-                }
-            }
+        case NK_DECLEXPR:{
+            check_type_length_expr(node->declexpr.type, ctx, node->line, node->column);
+
             Type *t = check_expr(node->declexpr.rvalue, ctx);
             if (t && node->type && !type_eq(t, node->type)) {
-                if (is_array(t) && is_array(node->type)) {
-                    sem_error(ctx, node->line, node->column, NULL, 0,
-                        "incompatible types in initialization (have array of type '%s', expected array of type '%s')",
-                        type_kind[t->array.elem->kind], type_kind[node->type->array.elem->kind]);
-                } else if (is_struct(t)) {
-                    sem_error(ctx, node->line, node->column, NULL, 0,
-                        "incompatible types in initialization (have struct of type '%.*s', expected '%s')",
-                        (int)t->struct_.length, t->struct_.start_pos, type_kind[node->type->kind]);
-                } else if (is_struct(node->type)) {
-                    sem_error(ctx, node->line, node->column, NULL, 0,
-                        "incompatible types in initialization (have '%s', expected struct of type '%.*s')",
-                        type_kind[t->kind], (int)node->type->struct_.length, node->type->struct_.start_pos);
-                } else {
-                    sem_error(ctx, node->line, node->column, NULL, 0,
-                        "incompatible types in initialization (have '%s', expected '%s')", type_kind[t->kind], type_kind[node->type->kind]);
-                }
+                sem_error(ctx, node->line, node->column, NULL, 0,
+                    "incompatible types in initialization (have '%s', expected '%s')",
+                    type_to_string(t), type_to_string(node->type));
             }
             break;
         }
@@ -965,28 +1067,14 @@ static void check_stmt(Node *node, SCtx *ctx, int loop_depth) {
                 break;
             }
             if (!type_eq(lv, rv)) {
-                if (is_array(lv) && is_array(rv)) {
-                    sem_error(ctx, node->line, node->column, NULL, 0,
-                        "incompatible types in initialization (have array of type '%s', expected array of type '%s')",
-                        type_kind[lv->array.elem->kind], type_kind[rv->array.elem->kind]);
-                } else if (is_struct(lv)) {
-                    sem_error(ctx, node->line, node->column, NULL, 0,
-                        "incompatible types in initialization (have '%s', expected struct of type '%.*s')",
-                        type_kind[rv->kind], (int)lv->struct_.length, lv->struct_.start_pos);
-                } else if (is_struct(rv)) {
-                    sem_error(ctx, node->line, node->column, NULL, 0,
-                        "incompatible types in initialization (have struct of type '%.*s', expected '%s')",
-                        (int)rv->struct_.length, rv->struct_.start_pos, type_kind[lv->kind]);
-                } else {
                 sem_error(ctx, node->line, node->column, NULL, 0,
-                    "incompatible types in assignment (have '%s', expected '%s')", type_kind[rv->kind], type_kind[lv->kind]);
-                }
+                    "incompatible types in assignment (have '%s', expected '%s')", type_to_string(rv), type_to_string(lv));
             }
             break;
         }
         case NK_EXPR:{
             check_expr(node->expr_stmt, ctx);
-            break;    
+            break;
         }
         case NK_BLOCK:{
             for (size_t i = 0; i < node->stmts.length; ++i) { 
@@ -1001,18 +1089,20 @@ static void check_stmt(Node *node, SCtx *ctx, int loop_depth) {
 
             if (t && !is_bool(t)) {
                 sem_error(ctx, node->for_stmt.expr->line, node->for_stmt.expr->column, NULL, 0,
-                    "condition must be of type 'bool' (have '%s')", type_kind[t->kind]);
+                    "condition must be of type 'bool' (have '%s')", type_to_string(t));
             }
-            for (size_t i = 0; i < node->for_stmt.step.length; i++) check_stmt(node->for_stmt.step.data[i], ctx, loop_depth);
-            
+            for (size_t i = 0; i < node->for_stmt.step.length; i++) {
+                check_expr(node->for_stmt.step.data[i], ctx);
+                check_stmt(node->for_stmt.step.data[i], ctx, loop_depth);
+            }
             check_stmt(node->for_stmt.stmt, ctx, loop_depth + 1);
             break;
         }
         case NK_FN: {
             ctx->current_ret = node->type->fn.ret;
             check_stmt(node->fn.stmt, ctx, loop_depth);
-            
-            if (node->fn.stmt && !is_voloid(node->type->fn.ret) && falls_through(node->fn.stmt)) { 
+
+            if (node->type->fn.ret && node->fn.stmt && !is_voloid(node->type->fn.ret) && falls_through(node->fn.stmt)) { 
                 Token name = node->fn.name;
                 sem_error(ctx, name.line, name.column, name.start_pos, name.length, "control may reach end of non-voloid function");
             }
@@ -1030,7 +1120,7 @@ static void check_stmt(Node *node, SCtx *ctx, int loop_depth) {
                 Type *tl = check_expr(len, ctx);
                 if (tl && tl->kind != T_I32) {
                     sem_error(ctx, len->line, len->column, NULL, 0,
-                        "array length must be of type 'i32' (have '%s')", type_kind[tl->kind]);
+                        "array length must be of type 'i32' (have '%s')", type_to_string(tl));
                 }
             }
             break;
@@ -1121,9 +1211,9 @@ static bool check_init_expr(Node *e, SCtx *ctx, SetInit *set, Mode mode) {
             if (mode == ADDR) return true;
 
             Symbol *sym = root_value(e);
-            if (!sym) return false;
+            if (!sym || !sym->type) return false;
 
-            if (!has(set, sym)) {
+            if (sym->type->kind != T_ARRAY && sym->type->kind != T_STRING && !has(set, sym)) {
                 sem_error(ctx, e->line, e->column, e->ident_.ident.start_pos, e->ident_.ident.length,
                     "use of uninitialized variable");
                     return false;
@@ -1146,12 +1236,13 @@ static bool check_init_expr(Node *e, SCtx *ctx, SetInit *set, Mode mode) {
             }
             return true;
         }
+        case NK_CAST: return check_init_expr(e->cast.expr, ctx, set, mode);
         case NK_INDEX: return check_init_expr(e->index_.index, ctx, set, READ) && check_init_expr(e->index_.array, ctx, set, mode);
         case NK_BINARY: return check_init_expr(e->binary.lhs, ctx, set, mode) && check_init_expr(e->binary.rhs, ctx, set, mode);
         case NK_UNARY: return check_init_expr(e->unary.expr, ctx, set, mode);
         case NK_FIELD: return check_init_expr(e->field.strc, ctx, set, mode);
         case NK_NUMBER: case NK_BOOLEAN:
-        case NK_STRING: default: return true;
+        case NK_STRING_LIT: default: return true;
     }
 }
 
@@ -1187,7 +1278,7 @@ static void init_check_stmt(SCtx *ctx, Node *stmt, SetInit *set, int in_loop) {
         }
         case NK_DECLEXPR: {
             if (!stmt->declexpr.rvalue) return;
-
+            
             check_init_expr(stmt->declexpr.rvalue, ctx, set, READ);
             add(set, stmt->declexpr.sym);
             break;
@@ -1197,8 +1288,9 @@ static void init_check_stmt(SCtx *ctx, Node *stmt, SetInit *set, int in_loop) {
             check_init_expr(stmt->assign.lvalue, ctx, set, ADDR);
             Symbol *sym = root_value(stmt->assign.lvalue);
 
-            if (sym)
+            if (sym) {
                 add(set, sym);
+            }
             break;
         }
         case NK_BLOCK:{
@@ -1238,24 +1330,27 @@ static void init_check_all(SCtx *ctx, Node *root) {
     }
 }
 
+static void def_print_fn(Scope *global, SCtx *ctx) {
+    const char *name = "print";
+    Type *type = mk_type_fn(NULL, 0, mk_type(T_VOLOID));
+    Symbol *sym = mk_symbol_fn(0, 0, type, name, 5, FN_DEFINED, BUILTIN_PRINT);
+    sym_insert(global, sym, ctx);
+}
+
 void sema(Node *root, const char *path) {
     SCtx ctx = {0};
     ctx.path = path;
     Scope *global = calloc(1, sizeof(Scope));
-
-    name_res(root, global, &ctx);
+    if (!global) {
+        fprintf(stderr, "calloc");
+        exit(EXIT_FAILURE);
+    }
+    
+    def_print_fn(global, &ctx);
+    name_res(root, global, &ctx, 0);
     check_stmt(root, &ctx, 0);
     init_check_all(&ctx, root);
     sem_flush_errors(&ctx);
 
     if (ctx.nerrs) exit(EXIT_FAILURE);
-}
-
-int main(void) {
-    const char *path = "../tests/test.vol";
-
-    Node *n = parse(lexer_all(path), path);
-    sema(n, path);
-
-    return EXIT_SUCCESS;
 }

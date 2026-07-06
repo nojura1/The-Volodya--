@@ -1,5 +1,4 @@
 #include "TokenNames.h"
-#include "Token.h"
 
 const char *TOKEN_NAMES[TOK__COUNT] = {
     /* --- Special --- */

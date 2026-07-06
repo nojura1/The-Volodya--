@@ -3,7 +3,7 @@
 
 typedef enum {
     NK_NUMBER,
-    NK_STRING,
+    NK_STRING_LIT,
     NK_BOOLEAN,
     NK_T_BUILTIN,
     NK_T_IDENT,
@@ -16,6 +16,7 @@ typedef enum {
     NK_FIELD,
     NK_CAST,
     NK_ARRAY_LIT,
+    NK_T_STRING,
     NK_BREAK,
     NK_IF,
     NK_WHILE,
@@ -44,9 +45,10 @@ struct Node {
     union {
         const char *error;
         struct { size_t value; Token t; } boolean;
-        struct { long long value; Token t; } number;
-        struct { Token value; } string;
+        struct { unsigned long long value; Token t; } number;
+        struct { Token value; } string_lit;
         struct { Token ident; Symbol *resolved; } ident_;
+        struct { Node *length; } t_string;
         Token t_builtin;
         Token t_ident;
         struct { NodeList elems; } array_lit;
@@ -56,7 +58,7 @@ struct Node {
         struct { Node *called; NodeList args; Symbol *resolved_fn; } call;
         struct { Node *array; Node *index; } index_;
         struct { Node *type; Node *length; } t_array;
-        struct { Node *strc; Node *ident; } field;
+        struct { Node *strc; Node *ident; StructField *field_decl; } field;
         struct { Node *cond; Node *stmt; } while_loop;
         Node *return_stmt;
         struct { Node *cond; Node *stmt; Node *else_chain; } if_stmt;
@@ -67,8 +69,8 @@ struct Node {
         struct { NodeList init; Node *expr; NodeList step; Node *stmt; } for_stmt;
         struct { Node *ret_type; Token name; NodeList params; Node *stmt; } fn;
         struct { Node *p_type; Token name; Symbol *sym; } param;
-        struct { Token name; NodeList fields; } struct_;
-        struct { Token name; Node *type; } stc_field;
+        struct { Token name; NodeList fields; size_t size, align; } struct_;
+        struct { Token name; Node *type; size_t field_offset, size; } stc_field;
         NodeList program;
     };
 };

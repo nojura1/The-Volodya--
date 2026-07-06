@@ -1,0 +1,486 @@
+struct Stats {
+    min:i32;
+    max:i32;
+    sum:i64;
+    square_sum:i64;
+    count:i32;
+}
+
+fn voloid i64_to_string(x:i64, out:string[]) {
+    i64 n = x;
+    i32 i = 0;
+    bool neg = false;
+    i64 zero = (i64)0;
+
+    if (n == zero) {
+        out[0] = (u32)48;
+        out[1] = (u32)0;
+        return;
+    }
+
+    if (n < zero) {
+        neg = true;
+        n = -n;
+    }
+
+    while (n > zero) {
+        i64 digit = n % (i64)10;
+        out[i] = (u32)((i32)digit + 48);
+
+        i = i + 1;
+        n = n / (i64)10;
+    }
+
+    if (neg) {
+        out[i] = (u32)45;
+        i = i + 1;
+    }
+
+    out[i] = (u32)0;
+
+    i32 left = 0;
+    i32 right = i - 1;
+
+    while (left < right) {
+        u32 tmp = out[left];
+        out[left] = out[right];
+        out[right] = tmp;
+
+        left = left + 1;
+        right = right - 1;
+    }
+}
+
+fn voloid print_i64(x:i64) {
+    string[32] buf;
+    i64_to_string(x, buf);
+    print(buf);
+}
+
+fn voloid print_i32(x:i32) {
+    i64 value = (i64)x;
+    print_i64(value);
+}
+
+fn voloid print_check(label:string[], ok:bool) {
+    print(label);
+
+    if (ok) {
+        print("OK\n");
+    } else {
+        print("FAILED\n");
+    }
+}
+
+fn voloid print_stats(label:string[], stats:Stats) {
+    print(label);
+    print("\n");
+
+    print("  min        = ");
+    print_i32(stats.min);
+    print("\n");
+
+    print("  max        = ");
+    print_i32(stats.max);
+    print("\n");
+
+    print("  sum        = ");
+    print_i64(stats.sum);
+    print("\n");
+
+    print("  square sum = ");
+    print_i64(stats.square_sum);
+    print("\n");
+
+    print("  count      = ");
+    print_i32(stats.count);
+    print("\n");
+}
+
+fn voloid fill_data(xs:i32[], count:i32) {
+    i32 i = 0;
+
+    while (i < count) {
+        i32 raw = (i * 7919 + 1237) % 20011;
+        i32 value = raw - 10000;
+
+        if (i % 11 == 0) {
+            value = 42;
+        }
+
+        if (i % 17 == 0) {
+            value = -228;
+        }
+
+        xs[i] = value;
+        i = i + 1;
+    }
+}
+
+fn voloid merge(
+    xs:i32[],
+    temp:i32[],
+    left:i32,
+    mid:i32,
+    right:i32
+) {
+    i32 i = left;
+    i32 j = mid + 1;
+    i32 k = left;
+
+    while (i <= mid && j <= right) {
+        if (xs[i] <= xs[j]) {
+            temp[k] = xs[i];
+            i = i + 1;
+        } else {
+            temp[k] = xs[j];
+            j = j + 1;
+        }
+
+        k = k + 1;
+    }
+
+    while (i <= mid) {
+        temp[k] = xs[i];
+        i = i + 1;
+        k = k + 1;
+    }
+
+    while (j <= right) {
+        temp[k] = xs[j];
+        j = j + 1;
+        k = k + 1;
+    }
+
+    k = left;
+
+    while (k <= right) {
+        xs[k] = temp[k];
+        k = k + 1;
+    }
+}
+
+fn voloid merge_sort(
+    xs:i32[],
+    temp:i32[],
+    left:i32,
+    right:i32
+) {
+    if (left >= right) {
+        return;
+    }
+
+    i32 mid = left + (right - left) / 2;
+    i32 second_half = mid + 1;
+
+    merge_sort(xs, temp, left, mid);
+    merge_sort(xs, temp, second_half, right);
+    merge(xs, temp, left, mid, right);
+}
+
+fn Stats single_stats(value:i32) {
+    Stats result;
+    i64 wide = (i64)value;
+
+    result.min = value;
+    result.max = value;
+    result.sum = wide;
+    result.square_sum = wide * wide;
+    result.count = 1;
+
+    return result;
+}
+
+fn Stats combine_stats(a:Stats, b:Stats) {
+    Stats result;
+
+    if (a.min < b.min) {
+        result.min = a.min;
+    } else {
+        result.min = b.min;
+    }
+
+    if (a.max > b.max) {
+        result.max = a.max;
+    } else {
+        result.max = b.max;
+    }
+
+    result.sum = a.sum + b.sum;
+    result.square_sum = a.square_sum + b.square_sum;
+    result.count = a.count + b.count;
+
+    return result;
+}
+
+fn Stats stats_range(xs:i32[], left:i32, right:i32) {
+    if (left == right) {
+        Stats one = single_stats(xs[left]);
+        return one;
+    }
+
+    i32 mid = left + (right - left) / 2;
+    i32 second_half = mid + 1;
+
+    Stats first = stats_range(xs, left, mid);
+    Stats second = stats_range(xs, second_half, right);
+    Stats result = combine_stats(first, second);
+
+    return result;
+}
+
+fn bool same_stats(a:Stats, b:Stats) {
+    if (a.min != b.min) {
+        return false;
+    }
+
+    if (a.max != b.max) {
+        return false;
+    }
+
+    if (a.sum != b.sum) {
+        return false;
+    }
+
+    if (a.square_sum != b.square_sum) {
+        return false;
+    }
+
+    if (a.count != b.count) {
+        return false;
+    }
+
+    return true;
+}
+
+fn bool is_sorted_range(xs:i32[], left:i32, right:i32) {
+    if (left >= right) {
+        return true;
+    }
+
+    i32 mid = left + (right - left) / 2;
+    i32 second_half = mid + 1;
+
+    bool first_ok = is_sorted_range(xs, left, mid);
+
+    if (!first_ok) {
+        return false;
+    }
+
+    bool second_ok = is_sorted_range(xs, second_half, right);
+
+    if (!second_ok) {
+        return false;
+    }
+
+    if (xs[mid] > xs[second_half]) {
+        return false;
+    }
+
+    return true;
+}
+
+fn i32 binary_search_recursive(
+    xs:i32[],
+    left:i32,
+    right:i32,
+    target:i32
+) {
+    if (left > right) {
+        return -1;
+    }
+
+    i32 mid = left + (right - left) / 2;
+    i32 value = xs[mid];
+
+    if (value == target) {
+        return mid;
+    }
+
+    if (value < target) {
+        i32 next = mid + 1;
+        i32 result = binary_search_recursive(
+            xs,
+            next,
+            right,
+            target
+        );
+
+        return result;
+    }
+
+    i32 previous = mid - 1;
+    i32 result = binary_search_recursive(
+        xs,
+        left,
+        previous,
+        target
+    );
+
+    return result;
+}
+
+fn bool valid_search_result(
+    xs:i32[],
+    index:i32,
+    target:i32
+) {
+    if (index < 0) {
+        return false;
+    }
+
+    if (xs[index] != target) {
+        return false;
+    }
+
+    return true;
+}
+
+fn i32 main() {
+    i32 count = 16384;
+    i32 high = count - 1;
+
+    i32[16384] xs;
+    i32[16384] temp;
+
+    print("generating 16384 values...\n");
+    fill_data(xs, count);
+
+    print("calculating recursive statistics before sorting...\n");
+    Stats before = stats_range(xs, 0, high);
+
+    print("running recursive merge sort...\n");
+    merge_sort(xs, temp, 0, high);
+
+    print("calculating recursive statistics after sorting...\n");
+    Stats after = stats_range(xs, 0, high);
+
+    print("checking order recursively...\n");
+    bool sorted = is_sorted_range(xs, 0, high);
+
+    bool preserved = same_stats(before, after);
+
+    i32 index_42 = binary_search_recursive(
+        xs,
+        0,
+        high,
+        42
+    );
+
+    i32 index_neg_228 = binary_search_recursive(
+        xs,
+        0,
+        high,
+        -228
+    );
+
+    i32 index_min = binary_search_recursive(
+        xs,
+        0,
+        high,
+        after.min
+    );
+
+    i32 index_max = binary_search_recursive(
+        xs,
+        0,
+        high,
+        after.max
+    );
+
+    i32 missing = binary_search_recursive(
+        xs,
+        0,
+        high,
+        30000
+    );
+
+    bool found_42 = valid_search_result(
+        xs,
+        index_42,
+        42
+    );
+
+    bool found_neg_228 = valid_search_result(
+        xs,
+        index_neg_228,
+        -228
+    );
+
+    bool found_min = valid_search_result(
+        xs,
+        index_min,
+        after.min
+    );
+
+    bool found_max = valid_search_result(
+        xs,
+        index_max,
+        after.max
+    );
+
+    bool missing_ok = missing == -1;
+
+    print("\n");
+    print_stats("statistics before sorting", before);
+
+    print("\n");
+    print_stats("statistics after sorting", after);
+
+    print("\n");
+    print("first value = ");
+    print_i32(xs[0]);
+    print("\n");
+
+    print("last value  = ");
+    print_i32(xs[high]);
+    print("\n\n");
+
+    print_check("sorted recursively:       ", sorted);
+    print_check("statistics preserved:     ", preserved);
+    print_check("binary search for 42:     ", found_42);
+    print_check("binary search for -228:   ", found_neg_228);
+    print_check("binary search for min:    ", found_min);
+    print_check("binary search for max:    ", found_max);
+    print_check("missing value rejected:   ", missing_ok);
+
+    bool all_ok = true;
+
+    if (!sorted) {
+        all_ok = false;
+    }
+
+    if (!preserved) {
+        all_ok = false;
+    }
+
+    if (!found_42) {
+        all_ok = false;
+    }
+
+    if (!found_neg_228) {
+        all_ok = false;
+    }
+
+    if (!found_min) {
+        all_ok = false;
+    }
+
+    if (!found_max) {
+        all_ok = false;
+    }
+
+    if (!missing_ok) {
+        all_ok = false;
+    }
+
+    print("\n");
+
+    if (all_ok) {
+        print("FINAL BACKEND TEST: PASSED\n");
+        return 0;
+    }
+
+    print("FINAL BACKEND TEST: FAILED\n");
+    return 1;
+}

@@ -1,18 +1,19 @@
 #include <stdlib.h>
 #include <stdio.h>
-#include <string.h>
-#include <ctype.h>
-#include <stdint.h>
+#include <limits.h>
+
 #include "../Token/TokenNames.h"
 #include "parser.h"
 
-#define MAX_ARRAY_LITERAL_LEN (1024)
-#define MAX_ARGS_LEN (256)
-#define MAX_TOPLEVEL (1024)
+#define MAX_ARRAY_LITERAL_LEN 1024
+#define MAX_ARGS_LEN 256
+#define MAX_TOPLEVEL 1024
+#define MAX_ERRORS 16
 
 typedef enum {
     SYNC_STMT,
     SYNC_EXPR,
+    SYNC_ELSE,
     SYNC_PAREN,
     SYNC_BRACE,
     SYNC_BLOCK,
@@ -26,6 +27,7 @@ typedef struct {
     size_t err_count;
     TokenVec *vec;
     int recovering;
+    bool report;
     size_t last_error_pos;
 } ParserContext;
 
@@ -53,12 +55,12 @@ static inline int match(ParserContext *p, TokenType tt) {
 static inline void begin_recovery(ParserContext *p) { p->recovering = 1; p->last_error_pos = p->pos; }
 static inline void end_recovery(ParserContext *p) { p->recovering = 0; }
 static inline int should_report(ParserContext *p, Token at) {
-    return !p->recovering || p->pos != p->last_error_pos || at.type == TOK_EOF;
+    return !p->report || (p->recovering && p->pos == p->last_error_pos && at.type != TOK_EOF);
 }
 
 static void error_tok(ParserContext *p, Token t, const char *msg) {
-    if (!should_report(p, t)) return;
-    if (p->err_count > 10) exit(EXIT_FAILURE);
+    if (should_report(p, t)) return;
+    if (p->err_count > MAX_ERRORS) exit(EXIT_FAILURE);
     fprintf(stderr, "%s:%zu:%zu: syntax error: %s\n", p->file, t.line, t.column, msg);
     p->err_count++;
     begin_recovery(p);
@@ -69,10 +71,11 @@ static int is_expr_sync(TokenType t) {
     return t==TOK_COMMA || t==TOK_RPAREN || t==TOK_RBRACKET || 
     t==TOK_SEMICOLON || t==TOK_RBRACE || t==TOK_EOF;
 }
-static int is_paren_sync(TokenType t) { return t==TOK_RPAREN || t==TOK_SEMICOLON || t==TOK_RBRACE || t==TOK_EOF; }
+static int is_else_sync(TokenType t) { return t==TOK_KW_ELSE || t==TOK_EOF; }
+static int is_paren_sync(TokenType t) { return t==TOK_RPAREN || t==TOK_SEMICOLON || t==TOK_LBRACE || t==TOK_RBRACE || t==TOK_EOF; }
 static int is_brace_sync(TokenType t) { return t==TOK_RBRACE || t==TOK_EOF; }
 static int is_block_sync(TokenType t) { return t==TOK_LBRACE || t==TOK_EOF; }
-static int is_brack_sync(TokenType t) { return t==TOK_RBRACKET || t==TOK_EOF; }
+static int is_brack_sync(TokenType t) { return t == TOK_RBRACKET || t == TOK_SEMICOLON || t == TOK_RBRACE || t == TOK_EOF; }
 static int is_top_sync(TokenType t) { return t==TOK_KW_FN || t==TOK_KW_STRUCT || t==TOK_EOF; }
 
 static void sync(ParserContext *p, SyncKind k) {
@@ -80,6 +83,7 @@ static void sync(ParserContext *p, SyncKind k) {
     switch (k) {
         case SYNC_STMT: pred = is_stmt_sync; break;
         case SYNC_EXPR: pred = is_expr_sync; break;
+        case SYNC_ELSE: pred = is_else_sync; break;
         case SYNC_PAREN: pred = is_paren_sync; break;
         case SYNC_BRACE: pred = is_brace_sync; break;
         case SYNC_BLOCK: pred = is_block_sync;break;
@@ -87,8 +91,6 @@ static void sync(ParserContext *p, SyncKind k) {
         case SYNC_TOPLEVEL: pred = is_top_sync; break;
     }
     while (!pred(peek(p).type)) { if (peek(p).type == TOK_EOF) break; p->pos++; }
-    if (k == SYNC_STMT && peek(p).type == TOK_SEMICOLON) consume(p);
-    if (k == SYNC_PAREN && peek(p).type == TOK_RPAREN) consume(p);
     end_recovery(p);
 }
 
@@ -99,6 +101,10 @@ static int expect_sync(ParserContext *p, TokenType expected, SyncKind k) {
     error_tok(p, peek(p), buf);
     sync(p, k);
     return 0;
+}
+
+static inline bool is_number(TokenType t) {
+    return t == TOK_DEC_LIT || t == TOK_HEX_LIT || t == TOK_BIN_LIT || t == TOK_OCT_LIT;
 }
 
 static void push(NodeList *l, Node *n) {
@@ -147,15 +153,15 @@ static Node *mk_t_ident(Token t) {
     return n;
 }
 
-static Node *mk_string(Token t) {
-    Node *n = mk(NK_STRING);
-    n->string.value = t;
+static Node *mk_string_lit(Token t) {
+    Node *n = mk(NK_STRING_LIT);
+    n->string_lit.value = t;
     n->line = t.line;
     n->column = t.column;
     return n;
 }
 
-static Node *mk_number(long long num, Token t) {
+static Node *mk_number(unsigned long long num, Token t) {
     Node *n = mk(NK_NUMBER);
     n->number.value = num;
     n->number.t = t;
@@ -227,6 +233,14 @@ static Node *mk_t_array(Node *type, Node *length) {
     return n;
 }
 
+static Node *mk_t_string(Token string_kw, Node *length) {
+    Node *n = mk(NK_T_STRING);
+    n->t_string.length = length;
+    n->line = string_kw.line;
+    n->column = string_kw.column;
+    return n;
+}
+
 static Node *mk_field(Node *strc, Token t) {
     Node *n = mk(NK_FIELD);
     n->field.strc = strc;
@@ -260,12 +274,12 @@ static Node *mk_declexpr(bool is_const, Node *type, Token name, Node *rvalue) {
     n->declexpr.type = type;
     n->declexpr.name = name;
     n->declexpr.rvalue = rvalue;
-    n->line = type->line;
-    n->column = type->column;
+    n->line = name.line;
+    n->column = name.column;
     return n;
 }
 
-static Node *mk_while(Node *cond, Node *stmt) { //-
+static Node *mk_while(Node *cond, Node *stmt) {
     Node *n = mk(NK_WHILE);
     n->while_loop.cond = cond;
     n->while_loop.stmt = stmt;
@@ -287,7 +301,7 @@ static Node *mk_break(Token t) {
     return n;
 }
 
-static Node *mk_if(Node *cond, Node *stmt) { //-
+static Node *mk_if(Node *cond, Node *stmt) {
     Node *n = mk(NK_IF);
     n->if_stmt.cond = cond;
     n->if_stmt.stmt = stmt;
@@ -295,7 +309,7 @@ static Node *mk_if(Node *cond, Node *stmt) { //-
     return n;
 }
 
-static Node *mk_for(NodeList forinit, Node *cond, NodeList forstep, Node *body) { //-
+static Node *mk_for(NodeList forinit, Node *cond, NodeList forstep, Node *body) {
     Node *n = mk(NK_FOR);
     n->for_stmt.init = forinit;
     n->for_stmt.expr = cond;
@@ -304,7 +318,7 @@ static Node *mk_for(NodeList forinit, Node *cond, NodeList forstep, Node *body) 
     return n;        
 }
 
-static Node *mk_block(NodeList stmt_list) { //-
+static Node *mk_block(NodeList stmt_list) {
     Node *n = mk(NK_BLOCK);
     n->stmts = stmt_list;
     return n;
@@ -318,14 +332,14 @@ static Node *mk_expr(Node *e) {
     return n;
 }
 
-static Node *mk_param(Token name, Node *type) { //-
+static Node *mk_param(Token name, Node *type) {
     Node *n = mk(NK_PARAM);
     n->param.name = name;
     n->param.p_type = type;
     return n;
 }
 
-static Node *mk_fn(Node *ret_type, Token name, NodeList p_list, Node *stmt) { //-
+static Node *mk_fn(Node *ret_type, Token name, NodeList p_list, Node *stmt) {
     Node *n = mk(NK_FN);
     n->fn.ret_type = ret_type;
     n->fn.name = name;
@@ -334,14 +348,14 @@ static Node *mk_fn(Node *ret_type, Token name, NodeList p_list, Node *stmt) { //
     return n;
 }
 
-static Node *mk_stc_field(Token name, Node *type) { //-
+static Node *mk_stc_field(Token name, Node *type) {
     Node *n = mk(NK_STC_FIELD);
     n->stc_field.name = name;
     n->stc_field.type = type;
     return n;
 }
 
-static Node *mk_struct(Token name, NodeList f_list) { //-
+static Node *mk_struct(Token name, NodeList f_list) {
     Node *n = mk(NK_STRUCT);
     n->struct_.name = name;
     n->struct_.fields = f_list;
@@ -359,8 +373,6 @@ static int binary_op(TokenType type, size_t *lbp, size_t *rbp) {
         default: return 0;
     }
 }
-
-static Node *parse_expr(ParserContext *p, size_t min_bp);
 
 static inline int is_closer_or_sep(TokenType t){
     return t==TOK_RPAREN || t==TOK_RBRACKET || t==TOK_RBRACE || t==TOK_COMMA || t==TOK_SEMICOLON;
@@ -383,21 +395,22 @@ static Node *convert(Token t, ParserContext *p, unsigned base) {
         unsigned char ch = (unsigned char)s[i];
         if (ch == '_') continue;
 
-        unsigned digit;
+        unsigned digit = 0;
         if (ch >= '0' && ch <= '9') digit = ch - '0';
         else if (ch >= 'a' && ch <= 'f') digit = ch - 'a' + 10;
         else if (ch >= 'A' && ch <= 'F') digit = ch - 'A' + 10;
 
         __uint128_t wide = (__uint128_t)acc * base + digit;
-        if (wide > UINT64_MAX) {
+        if (wide > ULLONG_MAX) {
             error_tok(p, t, "numeric literal is too large");
             return mk_error("overflow err");
         }
         acc = (unsigned long long)wide;
     }
-
     return mk_number(acc, t);
 }
+
+static Node *parse_expr(ParserContext *p, size_t min_bp);
 
 static Node *parse_primary_postfix(ParserContext *p) {
     Token t = peek(p);
@@ -409,9 +422,9 @@ static Node *parse_primary_postfix(ParserContext *p) {
         case TOK_HEX_LIT: n = convert(consume(p), p, 16); break;
         case TOK_BIN_LIT: n = convert(consume(p), p, 2); break;
         case TOK_OCT_LIT: n = convert(consume(p), p, 8); break;
-        case TOK_STRING_LIT: n = mk_string(consume(p)); break;
         case TOK_KW_TRUE: n = mk_boolean(1, consume(p)); break;
         case TOK_KW_FALSE: n = mk_boolean(0, consume(p)); break;
+        case TOK_STRING_LIT: n = mk_string_lit(consume(p)); break;
         case TOK_LPAREN:{
             consume(p);
             size_t err0 = p->err_count;
@@ -421,8 +434,9 @@ static Node *parse_primary_postfix(ParserContext *p) {
             break;
         }
         case TOK_LBRACKET:{
-            Token bra = consume(p);
+            Token b = consume(p);
             NodeList elems = (NodeList){NULL, 0, 0};
+
             if (peek(p).type != TOK_RBRACKET) {
                 size_t err_before = p->err_count;
                 push(&elems, parse_expr(p, 0));
@@ -431,8 +445,7 @@ static Node *parse_primary_postfix(ParserContext *p) {
                     sync(p, SYNC_BRACKET);
                     return mk_error("array lit err");
                 }
-
-                for (size_t i = 1; match(p, TOK_COMMA); ++i) {
+                for (size_t i = 0; match(p, TOK_COMMA); ++i) {
                     Token tokn = peek(p);
                     if (i == MAX_ARRAY_LITERAL_LEN) error_tok(p, tokn, "array literal is too long");
 
@@ -449,32 +462,32 @@ static Node *parse_primary_postfix(ParserContext *p) {
                     push(&elems, parse_expr(p, 0));
                 }
             }
-            
             expect_sync(p, TOK_RBRACKET, SYNC_BRACKET);
-            n = mk_array_lit(elems, bra); break;
+            n = mk_array_lit(elems, b);
+            break;
         }
         default:
             error_tok(p, peek(p), "expected expression");
             if (!is_closer_or_sep(t.type)) consume(p);
             return mk_error("expression err");
     }
-
     for (;;) {
         Token t2 = peek(p);
+
         if (t2.type == TOK_LPAREN) {
             consume(p);
             if (peek(p).type == TOK_EOF) {
                 return err_eof("unexpected end of input, expected expression or ')'", p);
             }
-            NodeList args = {NULL, 0, 0};
+            NodeList args = (NodeList){0};
             if (peek(p).type != TOK_RPAREN) {
                 size_t err_before = p->err_count;
                 push(&args, parse_expr(p, 0));
                 
                 if (err_before < p->err_count) {
-                    sync(p, SYNC_PAREN);
+                    sync(p, SYNC_STMT);
+                    return n;
                 }
-
                 while (match(p, TOK_COMMA)) {
                     Token tok = peek(p);
                     if (tok.type == TOK_RPAREN) {
@@ -503,15 +516,16 @@ static Node *parse_primary_postfix(ParserContext *p) {
 
             expect_sync(p, TOK_RBRACKET, SYNC_BRACKET);
             if (peek(p).type == TOK_LBRACKET) {
-                error_tok(p, peek(p), "multi-demensional arrays are not supported");
+                error_tok(p, peek(p), "multi-dimensional arrays are not supported");
                 sync(p, SYNC_PAREN); break;
             }
         } else if (t2.type == TOK_DOT && peek_next(p).type == TOK_IDENT) {
             consume(p);
             n = mk_field(n, consume(p));
-        } else break;
+        } else {
+            break;
+        }
     }
-
     return n;
 }
 
@@ -521,29 +535,41 @@ static inline int is_unary(Token t) {
 
 static inline int is_bitype(Token t) {
     return t.type == TOK_KW_I32 || t.type == TOK_KW_I64 || t.type == TOK_KW_U32 ||
-        t.type == TOK_KW_U64 || t.type == TOK_KW_BOOL || t.type == TOK_KW_STRING;
+        t.type == TOK_KW_U64 || t.type == TOK_KW_BOOL || t.type == TOK_KW_VOLOID;
 }
 
 static int try_parse_cast(ParserContext *p, Node **cast_type) {
     size_t tmp = p->pos;
-    if (consume(p).type != TOK_LPAREN) { p->pos = tmp; return 0; }
-    Token t = peek(p);
-
-    if (is_bitype(t)) *cast_type = mk_t_builtin(consume(p));
-    else if (t.type == TOK_IDENT) *cast_type = mk_t_ident(consume(p));
-    else { p->pos = tmp; return 0; }
-    
-    if (peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
-        consume(p);
-        *cast_type = mk_t_array(*cast_type, mk_number(-1, consume(p)));
-        if (peek(p).type == TOK_LBRACKET) { p->pos = tmp; return 0; }
+    if (consume(p).type != TOK_LPAREN) {
+        p->pos = tmp;
+        return 0;
     }
+    Token t = consume(p);
 
+    if (is_bitype(t)) {
+        *cast_type = mk_t_builtin(t);
+        if (peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
+            consume(p);
+            *cast_type = mk_t_array(*cast_type, mk_number((size_t)-1, consume(p)));
+        }
+    } else if (t.type == TOK_IDENT) {
+        *cast_type = mk_t_ident(t);
+        if (peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
+            consume(p);
+            *cast_type = mk_t_array(*cast_type, mk_number((size_t)-1, consume(p)));
+        }
+    } else if (t.type == TOK_KW_STRING && peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
+        consume(p);
+        *cast_type = mk_t_string(t, mk_number((size_t)-1, consume(p)));
+    } else {
+        p->pos = tmp;
+        return 0;
+    }
     if (match(p, TOK_RPAREN)) return 1;
     else { p->pos = tmp; return 0; }
 }
 
-static Node* parse_expr(ParserContext *p, size_t min_bp) {
+static Node *parse_expr(ParserContext *p, size_t min_bp) {
     Node *left = NULL;
     Node *cast_type;
 
@@ -554,9 +580,9 @@ static Node* parse_expr(ParserContext *p, size_t min_bp) {
         Token op = consume(p);
         Node *n = parse_expr(p, 80);
         left = mk_unary(op, n);
-    } else 
+    } else {
         left = parse_primary_postfix(p);
-
+    }
     for (;;) {
         Token op = peek(p);
         size_t lbp, rbp;
@@ -583,7 +609,9 @@ static Node *parse_lvalue(ParserContext *p) {
         } else if (peek(p).type == TOK_DOT && peek_next(p).type == TOK_IDENT) {
             consume(p);
             n = mk_field(n, consume(p));
-        } else break;
+        } else {
+            break;
+        }
     }
     return n;
 }
@@ -611,21 +639,64 @@ static int try_parse_declexpr(ParserContext *p, Node **out) {
     if (is_bitype(peek(p))) {
         committed = true;
         n = mk_t_builtin(consume(p));
+
         if (peek(p).type == TOK_LBRACKET) {
             consume(p);
-            Node *idx = parse_expr(p, 0);
-            expect_sync(p, TOK_RBRACKET, SYNC_BRACKET);
+            Node *idx = NULL;
+            if (!(is_number(peek(p).type) && peek_next(p).type == TOK_RBRACKET)) {
+                error_tok(p, peek(p), "size of an array has to be a plain numeric literal (e.g. 10)");
+            } else {
+                idx = parse_expr(p, 0);
+            }
+            if (!expect_sync(p, TOK_RBRACKET, SYNC_BRACKET)) consume(p);
             n = mk_t_array(n, idx);
         }
         Token tmp = peek(p);
-        if (tmp.type == TOK_LBRACKET) error_tok(p, tmp, "multi-demensional arrays are not supported");
-        else if (tmp.type == TOK_IDENT) name = consume(p);
-        else error_tok(p, tmp, "expected name after type");
+
+        if (tmp.type == TOK_LBRACKET) {
+            error_tok(p, tmp, "multi-dimensional arrays are not supported");
+        } else if (tmp.type == TOK_IDENT) {
+            name = consume(p);
+        } else {
+            error_tok(p, tmp, "expected name after type");
+        }
+    } else if (peek(p).type == TOK_KW_STRING) {
+        committed = true;
+        Token string_kw = consume(p);
+
+        if (peek(p).type == TOK_LBRACKET) {
+            consume(p);
+            Node *idx = NULL;
+            if (!(is_number(peek(p).type) && peek_next(p).type == TOK_RBRACKET)) {
+                error_tok(p, peek(p), "size of a string has to be a plain numeric literal (e.g. 10)");
+            } else {
+                idx = parse_expr(p, 0);
+            }
+            if (!expect_sync(p, TOK_RBRACKET, SYNC_BRACKET)) consume(p);
+            n = mk_t_string(string_kw, idx);
+            Token tmp = peek(p);
+
+            if (tmp.type == TOK_LBRACKET) {
+                error_tok(p, tmp, "multi-dimensional arrays are not supported");
+            } else if (tmp.type == TOK_IDENT) {
+                name = consume(p);
+            } else {
+                error_tok(p, tmp, "expected name after type");
+            }
+        } else {
+            n = mk_t_string(string_kw, NULL);
+            error_tok(p, peek(p), "expected string declaration of form: string[size]");
+        }
     } else if (peek(p).type == TOK_IDENT) {
         n = mk_t_ident(consume(p));
         if (peek(p).type == TOK_LBRACKET) {
             consume(p);
-            Node *idx = parse_expr(p, 0);
+            Node *idx = NULL;
+            if (!is_number(peek(p).type)) {
+                p->pos = mark; return 0;
+            } else {
+                idx = parse_expr(p, 0);
+            }
             if (!match(p, TOK_RBRACKET)) { p->pos = mark; return 0; }
             n = mk_t_array(n, idx);
         }
@@ -634,13 +705,17 @@ static int try_parse_declexpr(ParserContext *p, Node **out) {
         else if (tmp.type != TOK_IDENT) {
             if (!committed) { p->pos = mark; return 0; }
             error_tok(p, tmp, "expected name after type");
-        } else name = consume(p);
+        } else {
+            name = consume(p);
+        }
     } else if (is_const) {
         error_tok(p, peek(p), "expected type after const");
-    } else { p->pos = mark; return 0; }
-        
+    } else {
+        p->pos = mark; return 0;
+    }
+    
     Node *init = NULL;
-    if (match(p, TOK_EQ)) { init = parse_expr(p, 0); }
+    if (match(p, TOK_EQ)) init = parse_expr(p, 0);
     
     *out = mk_declexpr(is_const, n, name, init);
     return 1;
@@ -666,14 +741,13 @@ static NodeList forinit(ParserContext *p) {
         consume(p);
         init(&list, p);
     }
-
     return list;
 }
 
 static inline void step(NodeList *l, ParserContext *p) {
     Node *n = NULL;
-    if (try_parse_assign_expr(p, &n)) { push(l, n); }
-    else { push(l, parse_expr(p, 0)); }
+    if (try_parse_assign_expr(p, &n)) push(l, n);
+    else push(l, parse_expr(p, 0));
 }
 
 static NodeList forstep(ParserContext *p) {
@@ -684,13 +758,12 @@ static NodeList forstep(ParserContext *p) {
         consume(p);
         step(&list, p);
     }
-
     return list;
 } 
 
 static Node *parse_block(ParserContext *p);
 
-static Node *diispecherzadach(ParserContext *p) {
+static Node *parse_stmt(ParserContext *p) {
     switch (peek(p).type) {
         case TOK_LBRACE: return parse_block(p);
         case TOK_SEMICOLON: consume(p); return NULL;
@@ -707,15 +780,17 @@ static Node *diispecherzadach(ParserContext *p) {
             if (!expect_sync(p, TOK_LPAREN, SYNC_PAREN)) return mk_error("while err");
             Node *c = parse_expr(p, 0);
             expect_sync(p, TOK_RPAREN, SYNC_PAREN);
-            return mk_while(c, diispecherzadach(p));
+            return mk_while(c, parse_stmt(p));
         }
         case TOK_KW_IF:{
             consume(p);
+            
             if (!expect_sync(p, TOK_LPAREN, SYNC_PAREN)) return mk_error("if err");
             Node *c = parse_expr(p, 0);
             expect_sync(p, TOK_RPAREN, SYNC_PAREN);
-            Node *n = mk_if(c, diispecherzadach(p));
-            if (match(p, TOK_KW_ELSE)) n->if_stmt.else_chain = diispecherzadach(p);
+
+            Node *n = mk_if(c, parse_stmt(p));
+            if (match(p, TOK_KW_ELSE)) n->if_stmt.else_chain = parse_stmt(p);
             return n;
         }
         case TOK_KW_FOR: {
@@ -725,15 +800,29 @@ static Node *diispecherzadach(ParserContext *p) {
             NodeList fi = (NodeList){0};
             Node *cond = NULL;
             NodeList st = (NodeList){0};
-            if (peek(p).type == TOK_RPAREN) 
-                error_tok(p, consume(p), "did you mean ';;' for an empty for loop initializer?");
-            else {
-                if (!match(p, TOK_SEMICOLON)) { fi = forinit(p); expect_sync(p, TOK_SEMICOLON, SYNC_PAREN); }
-                if (peek(p).type == TOK_RPAREN) error_tok(p, peek(p), "expect expresion and/or TOK_SEMICOLON");
-                else if (!match(p, TOK_SEMICOLON)) { cond = parse_expr(p, 0); expect_sync(p, TOK_SEMICOLON, SYNC_PAREN); }
-                if (!match(p, TOK_RPAREN)) { st = forstep(p); expect_sync(p, TOK_RPAREN, SYNC_PAREN); }
+            
+            if (peek(p).type != TOK_RPAREN) {
+                if (!match(p, TOK_SEMICOLON)) {
+                    fi = forinit(p); 
+                    if (!expect_sync(p, TOK_SEMICOLON, SYNC_PAREN)) p->report = false;
+                }
+            } else {
+                error_tok(p, peek(p), "did you mean ';;' for an empty for loop initializer?");
             }
-            Node *body = diispecherzadach(p);
+            if (peek(p).type != TOK_RPAREN) {
+                if (!match(p, TOK_SEMICOLON)) {
+                    cond = parse_expr(p, 0);
+                    if (!expect_sync(p, TOK_SEMICOLON, SYNC_PAREN)) p->report = false;
+                }
+            } else {
+                error_tok(p, peek(p), "expected ';' after for initializer");
+            }
+            if (!match(p, TOK_RPAREN)) {
+                st = forstep(p);
+                if (!expect_sync(p, TOK_RPAREN, SYNC_PAREN)) p->report = false;
+            }
+            p->report = true;
+            Node *body = parse_stmt(p);
             return mk_for(fi, cond, st, body);
         }
         default: {
@@ -741,22 +830,30 @@ static Node *diispecherzadach(ParserContext *p) {
 
             Node *decl = NULL;
             if (try_parse_declexpr(p, &decl)) {
+                if (p->err_count > err0) p->report = false;
                 expect_sync(p, TOK_SEMICOLON, SYNC_STMT);
-                if (p->err_count > err0) return mk_error("declexpr err");
+                if (p->err_count > err0) {
+                    p->report = true;
+                    return mk_error("declexpr err");
+                }
                 return decl;
             }
 
             Node *asg = NULL;
             if (try_parse_assign_expr(p, &asg)) {
+                if (p->err_count > err0) p->report = false;
                 expect_sync(p, TOK_SEMICOLON, SYNC_STMT);
-                if (p->err_count > err0) return mk_error("assign expr err");
+                if (p->err_count > err0) {
+                    p->report = true;
+                    return mk_error("assign expr err");
+                }
                 return asg;
             }
 
             Node *e = parse_expr(p, 0);
+            if (p->err_count > err0) p->report = false;
             expect_sync(p, TOK_SEMICOLON, SYNC_STMT);
-            if (p->err_count > err0) return mk_error("exprstmt err");
-
+            p->report = true;   
             return mk_expr(e);
         }
     }
@@ -765,43 +862,64 @@ static Node *diispecherzadach(ParserContext *p) {
 static Node *parse_block(ParserContext *p) {
     expect_sync(p, TOK_LBRACE, SYNC_STMT);
     NodeList stmt_list = (NodeList){0};
+    SyncKind sk = SYNC_BRACE;
 
     while (peek(p).type != TOK_RBRACE && peek(p).type != TOK_EOF) {
-        Node *stmt = diispecherzadach(p);
+        if (peek(p).type == TOK_KW_FN || peek(p).type == TOK_KW_STRUCT) {
+            sk = SYNC_TOPLEVEL;
+            break;
+        }
+        if (peek(p).type == TOK_KW_ELSE) {
+            sk = SYNC_ELSE;
+            break;
+        }
+        Node *stmt = parse_stmt(p);
         push(&stmt_list, stmt);
     }
-
-    expect_sync(p, TOK_RBRACE, SYNC_BRACE);
+    expect_sync(p, TOK_RBRACE, sk);
     return mk_block(stmt_list);
 }
-
 
 static NodeList parse_param(ParserContext *p) {
     NodeList list = (NodeList){NULL, 0, 0};
 
-    if (peek(p).type != TOK_IDENT && peek(p).type != TOK_RPAREN) error_tok(p, peek(p), "expected parameter(s) of form identifier: type");
+    if (peek(p).type != TOK_IDENT && peek(p).type != TOK_RPAREN) {
+        error_tok(p, peek(p), "expected parameter(s) of form identifier: type");
+        sync(p, SYNC_PAREN);
+        return list;
+    }
 
     for (size_t i = 0; peek(p).type == TOK_IDENT; ++i) {
         if (i == MAX_ARGS_LEN) error_tok(p, peek(p), "too many arguments in the function");
         
         Token t = consume(p);
         Node *p_type = NULL;
-        expect_sync(p, TOK_COLON, SYNC_PAREN);
-        Token tmp = peek(p);
+        if (!expect_sync(p, TOK_COLON, SYNC_PAREN)) return list;
+        Token temp_for_ptype = consume(p);
 
-        if (is_bitype(tmp) || tmp.type == TOK_IDENT) {
-            p_type = tmp.type == TOK_IDENT ? mk_t_ident(consume(p)) : mk_t_builtin(consume(p));
+        if (is_bitype(temp_for_ptype)) {
+            p_type = mk_t_builtin(temp_for_ptype);
             if (peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
                 consume(p);
-                p_type = mk_t_array(p_type, mk_number(-1, consume(p)));
-                if (peek(p).type == TOK_LBRACKET) {
-                    error_tok(p, peek(p), "multi-demensional arrays are not supported");
-                    sync(p, SYNC_PAREN);
-                    return list;
-                }
+                p_type = mk_t_array(p_type, mk_number((size_t)-1, consume(p)));
             }
+        } else if (temp_for_ptype.type == TOK_IDENT) {
+            p_type = mk_t_ident(temp_for_ptype);
+            if (peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
+                consume(p);
+                p_type = mk_t_array(p_type, mk_number((size_t)-1, consume(p)));
+            }
+        } else if (temp_for_ptype.type == TOK_KW_STRING && peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
+            consume(p);
+            p_type = mk_t_string(temp_for_ptype, mk_number((size_t)-1, consume(p)));
         } else {
-            error_tok(p, t, "expected type");
+            error_tok(p, temp_for_ptype, "expected type");
+            sync(p, SYNC_PAREN);
+            return list;
+        }
+
+        if (peek(p).type == TOK_LBRACKET) {
+            error_tok(p, peek(p), "multi-dimensional arrays are not supported");
             sync(p, SYNC_PAREN);
             return list;
         }
@@ -809,73 +927,130 @@ static NodeList parse_param(ParserContext *p) {
         push(&list, mk_param(t, p_type));
         if (match(p, TOK_COMMA)) { 
             if (peek(p).type != TOK_IDENT) error_tok(p, peek(p), "trailing comma");
-        } else 
+        } else {
             break;
+        }
     }
     return list;
 }
 
 static Node *parse_fn(ParserContext *p) {
-    Token t = peek(p);
-    Node *ret_type = NULL;
+    Token tret_type = consume(p);
+    Node *nret_type = NULL;
 
-    if (is_bitype(t) || t.type == TOK_IDENT || t.type == TOK_KW_VOLOID) {
-        ret_type = t.type == TOK_IDENT ? mk_t_ident(consume(p)) : mk_t_builtin(consume(p));
+    if (is_bitype(tret_type)) {
+        nret_type = mk_t_builtin(tret_type);
         if (peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
             consume(p);
-            ret_type = mk_t_array(ret_type, mk_number(-1, consume(p)));
-            if (peek(p).type == TOK_LBRACKET) {
-                error_tok(p, peek(p), "multi-demensional arrays are not supported");
-                sync(p, SYNC_BLOCK);
-                Node *stmt = diispecherzadach(p);
-                return mk_error("fn err");
-            }
+            nret_type = mk_t_array(nret_type, mk_number((size_t)-1, consume(p)));
+        }
+    } else if (tret_type.type == TOK_IDENT) {
+        nret_type = mk_t_ident(tret_type);
+        if (peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
+            consume(p);
+            nret_type = mk_t_array(nret_type, mk_number((size_t)-1, consume(p)));
+        }
+    } else if (tret_type.type == TOK_KW_STRING) {
+        if (peek(p).type == TOK_LBRACKET && peek_next(p).type == TOK_RBRACKET) {
+            consume(p);
+            nret_type = mk_t_string(tret_type, mk_number((size_t)-1, consume(p)));
+        } else {
+            error_tok(p, tret_type, "string return type must be written as string[]");
+            sync(p, SYNC_TOPLEVEL);
+            return mk_error("fn err");
         }
     } else {
-        error_tok(p, t, "expected return type");
-        sync(p, SYNC_BLOCK);
-        Node *stmt = diispecherzadach(p);
+        error_tok(p, tret_type, "expected return type");
+        sync(p, SYNC_TOPLEVEL);
         return mk_error("fn err");
     }
 
+    if (peek(p).type == TOK_LBRACKET) {
+        error_tok(p, peek(p), "multi-dimensional arrays are not supported");
+        sync(p, SYNC_TOPLEVEL);
+        return mk_error("fn err");
+    }
     Token name = (Token){0};
 
     if (peek(p).type != TOK_IDENT) { error_tok(p, peek(p), "expected name"); }
     else name = consume(p);
 
     expect_sync(p, TOK_LPAREN, SYNC_PAREN);
+
+    size_t err = p->err_count;
     NodeList list = parse_param(p);
+    if (p->err_count != err) p->report = false;
+    
     expect_sync(p, TOK_RPAREN, SYNC_PAREN);
+    p->report = true;
 
-    Node *stmt = diispecherzadach(p);
-
-    return mk_fn(ret_type, name, list, stmt);
+    Node *stmt = parse_stmt(p);
+    return mk_fn(nret_type, name, list, stmt);
 }
 
 static NodeList parse_field(ParserContext *p) {
     NodeList fields = (NodeList){NULL, 0, 0};
+    if (peek(p).type != TOK_IDENT)
+        error_tok(p, peek(p), "empty structs are not allowed");
+
     while (peek(p).type == TOK_IDENT) {
         Node *n = NULL;
         Token name = consume(p);
-        expect_sync(p, TOK_COLON, SYNC_BRACE);
-        Token t = peek(p);
+        expect_sync(p, TOK_COLON, SYNC_STMT);
+        Token t = consume(p);
 
-        if (is_bitype(t) || t.type == TOK_IDENT) {
-            n = t.type == TOK_IDENT ? mk_t_ident(consume(p)) : mk_t_builtin(consume(p));
+        if (is_bitype(t)) {
+            n = mk_t_builtin(t);
             if (peek(p).type == TOK_LBRACKET) {
                 consume(p);
-                n = mk_t_array(n, parse_expr(p, 0));
-                expect_sync(p, TOK_RBRACKET, SYNC_BRACKET);
+                Node *idx = NULL;
+                if (!(is_number(peek(p).type) && peek_next(p).type == TOK_RBRACKET)) {
+                    error_tok(p, peek(p), "size of an array has to be a plain numeric literal (e.g. 10)");
+                } else {
+                    idx = parse_expr(p, 0);
+                }
+                expect_sync(p, TOK_RBRACKET, SYNC_STMT);
+                n = mk_t_array(n, idx);
                 if (peek(p).type == TOK_LBRACKET) {
-                    error_tok(p, peek(p), "multi-demensional arrays are not supported");
+                    error_tok(p, peek(p), "multi-dimensional arrays are not supported");
+                    sync(p, SYNC_STMT);
+                }
+            }
+        } else if (t.type == TOK_IDENT) {
+            n = mk_t_ident(t);
+            if (peek(p).type == TOK_LBRACKET) {
+                consume(p);
+                Node *idx = NULL;
+                if (!(is_number(peek(p).type) && peek_next(p).type == TOK_RBRACKET)) {
+                    error_tok(p, peek(p), "size of an array has to be a plain numeric literal (e.g. 10)");
+                } else {
+                    idx = parse_expr(p, 0);
+                }
+                if (!expect_sync(p, TOK_RBRACKET, SYNC_BRACKET)) consume(p);
+                n = mk_t_array(n, idx);
+                if (peek(p).type == TOK_LBRACKET) {
+                    error_tok(p, peek(p), "multi-dimensional arrays are not supported");
                     sync(p, SYNC_PAREN);
                 }
+            }
+        } else if (t.type == TOK_KW_STRING && peek(p).type == TOK_LBRACKET) {
+            consume(p);
+            Node *idx = NULL;
+            if (!(is_number(peek(p).type) && peek_next(p).type == TOK_RBRACKET)) {
+                error_tok(p, peek(p), "size of a string has to be a plain numeric literal (e.g. 10)");
+            } else {
+                idx = parse_expr(p, 0);
+            }
+            if (!expect_sync(p, TOK_RBRACKET, SYNC_BRACKET)) consume(p);
+            n = mk_t_string(t, idx);
+            if (peek(p).type == TOK_LBRACKET) {
+                error_tok(p, peek(p), "multi-dimensional arrays are not supported");
+                sync(p, SYNC_PAREN);
             }
         } else {
             error_tok(p, peek(p), "expected name");
             sync(p, SYNC_PAREN);
         }
-
         expect_sync(p, TOK_SEMICOLON, SYNC_BRACE);
         push(&fields, mk_stc_field(name, n));
     }
@@ -915,8 +1090,8 @@ static NodeList parse_program(ParserContext *p) {
     return program;
 }
 
-static void dump_parser(size_t d, Node *n, ParserContext *p) {
-    for (int i = 0; i < d; i++) printf(" ");
+[[maybe_unused]] static void dump_parser(size_t d, Node *n, ParserContext *p) {
+    for (size_t i = 0; i < d; i++) printf(" ");
     if (!n) { printf("(null)\n"); return; }
     switch (n->kind) {
         case NK_NUMBER: printf("Number(%lld)", n->number.value); break;
@@ -924,14 +1099,16 @@ static void dump_parser(size_t d, Node *n, ParserContext *p) {
         case NK_IDENT: printf("Ident(%.*s)", (int)n->ident_.ident.length, n->ident_.ident.start_pos); break;
         case NK_T_BUILTIN: printf("Builtin type(%.*s)", (int)n->t_builtin.length, n->t_builtin.start_pos); break;
         case NK_T_IDENT: printf("Ident type(%.*s)", (int)n->t_ident.length, n->t_ident.start_pos); break;
-        case NK_STRING: printf("String(%.*s)", (int)n->string.value.length, n->string.value.start_pos); break;
+        case NK_STRING_LIT: printf("String(%.*s)", (int)n->string_lit.value.length, n->string_lit.value.start_pos); break;
         case NK_CALL:
             printf("call (");
             dump_parser(0, n->call.called, p);
             printf(", [");
-            for (int i = 0; i < n->call.args.length; i++) {
+            for (size_t i = 0; i < n->call.args.length; i++) {
                 dump_parser(0, n->call.args.data[i], p);
-                i == n->call.args.length - 1 ? : printf(", ");
+                if (i != n->call.args.length - 1) {
+                    printf(", ");
+                }
             }
             printf("])"); break;
         case NK_INDEX:
@@ -969,13 +1146,15 @@ static void dump_parser(size_t d, Node *n, ParserContext *p) {
             printf("\n)"); break;
         case NK_ARRAY_LIT:
             printf("array literal [");
-            for (int i = 0; i < n->array_lit.elems.length; i++) {
+            for (size_t i = 0; i < n->array_lit.elems.length; i++) {
                 dump_parser(0, n->array_lit.elems.data[i], p);
-                i == n->array_lit.elems.length - 1 ? : printf(", ");
+                if (i != n->array_lit.elems.length - 1) {
+                    printf(", ");
+                }
             }
             printf("]\n"); break;
         case NK_ERROR: printf("%s", n->error); break;
-        case NK_RETURN: printf("return"); dump_parser(0, n->return_stmt, p); break;
+        case NK_RETURN: printf("return "); dump_parser(0, n->return_stmt, p); break;
         case NK_WHILE: printf("while (cond: ");
             dump_parser(0, n->while_loop.cond, p);
             printf(")\nstmt: ");
@@ -1003,24 +1182,31 @@ static void dump_parser(size_t d, Node *n, ParserContext *p) {
         case NK_BLOCK: printf("{\n");
             for (size_t i = 0; i < n->stmts.length; i++) {
                 dump_parser(0, n->stmts.data[i], p);
-                i == n->stmts.length - 1 ? : printf("\n");
+                if (i != n->stmts.length - 1) {
+                    printf("\n");
+                }
             }
             printf("\n}\n"); break;
         case NK_FOR:
             printf("forinit:\n");
-            for (int i = 0; i < n->for_stmt.init.length; i++) {
+            for (size_t i = 0; i < n->for_stmt.init.length; i++) {
                 dump_parser(0, n->for_stmt.init.data[i], p);
-                i == n->for_stmt.init.length - 1 ? : printf("\n");
+                if (i != n->for_stmt.init.length - 1) {
+                    printf("\n");
+                }
             }
             printf("\ncond:\n");
             dump_parser(0, n->for_stmt.expr, p);
             printf("\nforstep:\n");
-            for (int i = 0; i < n->for_stmt.step.length; i++) {
+            for (size_t i = 0; i < n->for_stmt.step.length; i++) {
                 dump_parser(0, n->for_stmt.step.data[i], p);
-                i == n->for_stmt.step.length - 1 ? : printf("\n");
+                if (i != n->for_stmt.step.length - 1) {
+                    printf("\n");
+                }
             }
             printf("\nstmt:\n");
-            dump_parser(0, n->for_stmt.stmt, p); break;
+            dump_parser(0, n->for_stmt.stmt, p);
+            break;
         case NK_PARAM:
             printf("param: ");
             dump_parser(0, n->param.p_type, p);
@@ -1030,37 +1216,43 @@ static void dump_parser(size_t d, Node *n, ParserContext *p) {
             printf("\nfn return: ");
             dump_parser(0, n->fn.ret_type, p);
             printf(" name: %.*s\n", (int)n->fn.name.length, n->fn.name.start_pos);
-            for (int i = 0; i < n->fn.params.length; i++) {
+            for (size_t i = 0; i < n->fn.params.length; i++) {
                 dump_parser(0, n->fn.params.data[i], p);
                 printf("\n");
             }
-            dump_parser(0, n->fn.stmt, p); break;
+            dump_parser(0, n->fn.stmt, p);
+            break;
         case NK_STC_FIELD:
             printf("name: %.*s ", (int)n->stc_field.name.length, n->stc_field.name.start_pos);
             printf("field: ");
-            dump_parser(0, n->stc_field.type, p); break;
+            dump_parser(0, n->stc_field.type, p);
+            break;
         case NK_STRUCT:
             printf("struct name: %.*s\n", (int)n->struct_.name.length, n->struct_.name.start_pos);
             printf("fields:\n");
-            for (int i = 0; i < n->struct_.fields.length; i++) {
+            for (size_t i = 0; i < n->struct_.fields.length; i++) {
                 dump_parser(0, n->struct_.fields.data[i], p);
-                i == n->struct_.fields.length - 1 ? : printf("\n");
+                if (i != n->struct_.fields.length - 1) {
+                    printf("\n");
+                }
             }
             break;
         case NK_PROGRAM:
-            for (int i = 0; i < n->program.length; i++) {
+            for (size_t i = 0; i < n->program.length; i++) {
                 dump_parser(0, n->program.data[i], p);
                 printf("\n");
             }
+            break;
         default: return;
     }
 }
 
 Node *parse(TokenVec vec, const char *path) {
-    ParserContext p = (ParserContext){ .file = path, .vec = &vec, .pos = 0 };
+    ParserContext p = (ParserContext){ .file = path, .vec = &vec, .pos = 0, .report = true };
     Node *n = mk(NK_PROGRAM);
     n->program = parse_program(&p);
     //dump_parser(0, n, &p);
     if (p.err_count) exit(EXIT_FAILURE);
+    tokenvec_free(&vec);
     return n;
 }

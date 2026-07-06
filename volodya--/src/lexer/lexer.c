@@ -3,15 +3,15 @@
 #include <errno.h>
 #include <string.h>
 #include <ctype.h>
-#include <stdint.h>
+
 #include "lexer.h"
-#include "../Token/TokenVec.h"
 #include "../Token/TokenNames.h"
 
 #define MAX_FILE_SIZE (32 * 1024 * 1024)
-#define MAX_LEXEME_LEN (256)
+#define MAX_LEXEME_LEN 256
 #define MAX_STRING_LITERAL_LEN (4 * 1024)
 #define MAX_TOKEN_AMOUNT (64 * 1024)
+#define MAX_ERRORS 16
 
 typedef struct {
     size_t line;
@@ -31,6 +31,7 @@ typedef struct Lexer {
     LexError *errors;
     size_t err_count, err_cap;
     bool had_error;
+    bool utf8_error;
     const char *path;
 } Lexer;
 
@@ -55,7 +56,7 @@ static const Keyword keywords[] = {
     {"false",  TOK_KW_FALSE},
 };
 
-char *read_file(const char *path, size_t *len_out) {
+static char *read_file(const char *path, size_t *len_out) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
 
@@ -81,7 +82,7 @@ char *read_file(const char *path, size_t *len_out) {
     return buf;
 }
 
-char *read_file_or_exit(const char *path, size_t *len_out) {
+static char *read_file_or_exit(const char *path, size_t *len_out) {
     char *p = read_file(path, len_out);
     if (!p) {
         fprintf(stderr, "fatal: cannot read %s: %s\n", path, strerror(errno));
@@ -121,12 +122,21 @@ static inline int match(Lexer *const lexer, char expected) {
 }
 
 static inline Token make_token(TokenType type, const char *start, size_t l, size_t line, size_t column) {
-    return (Token){type, start, l, line, column};
+    return (Token){type, start, l, line, column, 0, NULL};
 }
 
-void dump_lex_errors(const Lexer *const lex);
+static inline void set_str_lit_length_bytes(Token *str_token, size_t length, char *lit) {
+    str_token->lit_length_bytes = length;
+    str_token->lit = lit;
+}
 
-void lex_error(Lexer *const lexer, const char *msg) {
+static void dump_lex_errors(const Lexer *const lex) {
+    for (size_t i = 0; i < lex->err_count; i++) {
+        fprintf(stderr, "%s:%zu:%zu: lexical error: %s\n", lex->path, lex->errors[i].line, lex->errors[i].column, lex->errors[i].msg);
+    }
+}
+
+static void lex_error(Lexer *const lexer, const char *msg, size_t line, size_t column) {
     lexer->had_error = true;
 
     if (lexer->err_cap == lexer->err_count) {
@@ -137,14 +147,14 @@ void lex_error(Lexer *const lexer, const char *msg) {
             exit(EXIT_FAILURE);
         }
     }
-    if (lexer->err_count >= 10) {
+    if (lexer->err_count > MAX_ERRORS) {
         dump_lex_errors(lexer);
         exit(EXIT_FAILURE);
     }
     size_t t = lexer->err_count++;
     lexer->errors[t].msg = msg;
-    lexer->errors[t].line = lexer->line;
-    lexer->errors[t].column = lexer->column;
+    lexer->errors[t].line = line;
+    lexer->errors[t].column = column;
 }
 
 static void skip_ignorable(Lexer *const lexer) {
@@ -154,11 +164,15 @@ static void skip_ignorable(Lexer *const lexer) {
         
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
             advance(lexer);
+            lexer->utf8_error = false;
         } else if (c == '/' && c1 == '/') {
             for (; peek(lexer) != '\n' && peek(lexer) != '\0'; advance(lexer));
         } else if (c == '/' && c1 == '*') {
             for (; (peek(lexer) != '*' || peek_next(lexer) != '/') && peek(lexer) != '\0'; advance(lexer));
-            if (peek(lexer) == '\0') { lex_error(lexer, "unterminated block comment"); break; }
+            if (peek(lexer) == '\0') {
+                lex_error(lexer, "unterminated block comment", lexer->line, lexer->column);
+                break;
+            }
             advance(lexer);
             advance(lexer);
         } else {
@@ -167,7 +181,7 @@ static void skip_ignorable(Lexer *const lexer) {
     }
 }
 
-TokenType keyword_lookup(const char *lex, const size_t len) {
+static TokenType keyword_lookup(const char *lex, const size_t len) {
     for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
         const char *t = keywords[i].lex;
         if (strlen(t) == len && strncmp(t, lex, len) == 0) return keywords[i].kind;
@@ -182,12 +196,12 @@ static Token scan_identifier(Lexer *const lexer) {
 
     if (isalpha((unsigned char) peek(lexer))) {
         for (size_t i = 0; isalnum((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer), ++i) {
-            if (i == MAX_LEXEME_LEN) lex_error(lexer, "too long identifier");
+            if (i == MAX_LEXEME_LEN) lex_error(lexer, "too long identifier", lexer->line, lexer->column);
         }
     }
 
-    size_t l = lexer->src + lexer->pos - start_pos;
-    return make_token(keyword_lookup(start_pos, l), start_pos, l, line_start, column_start);
+    ptrdiff_t l = lexer->src + lexer->pos - start_pos;
+    return make_token(keyword_lookup(start_pos, (size_t)l), start_pos, (size_t)l, line_start, column_start);
 }
 
 static Token scan_with_prefix(Lexer *const lexer, int (*fun)(int), TokenType tt) {
@@ -197,26 +211,22 @@ static Token scan_with_prefix(Lexer *const lexer, int (*fun)(int), TokenType tt)
     const char *start_pos = lexer->src + lexer->pos;
     size_t line_start = lexer->line;
     size_t column_start = lexer->column;
-    char c = advance(lexer);
+    char c = peek(lexer);
 
-    if (c == '_') lex_error(lexer, "underscore cannot appear at the beginning of a numeric literal");
-    else if (!fun((unsigned char) c)) lex_error(lexer, "expected digit after prefix");
+    if (c == '_') lex_error(lexer, "underscore cannot appear at the beginning of a numeric literal", lexer->line, lexer->column);
+    else if (!fun((unsigned char) c)) lex_error(lexer, "expected digit after prefix", lexer->line, lexer->column);
 
-    if (fun((unsigned char) peek(lexer))) {
-        for (size_t i = 0; fun((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer), ++i) {
-            if (i == MAX_LEXEME_LEN) lex_error(lexer, "too long numeric literal");
-        }
+    for (size_t i = 0; fun((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer), ++i) {
+        if (i == MAX_LEXEME_LEN) lex_error(lexer, "too long numeric literal", lexer->line, lexer->column);
     }
 
-    c = peek(lexer);
-
-    if (isalnum((unsigned char) c) || c == '_') {
-        lex_error(lexer, "invalid numeric literal: unexpected characters");
+    if (isalnum((unsigned char) peek(lexer)) || peek(lexer) == '_') {
+        lex_error(lexer, "invalid numeric literal: unexpected characters", lexer->line, lexer->column);
         for (; isalnum((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer));
     }
 
-    size_t l = lexer->src + lexer->pos - start_pos;
-    return make_token(tt, start_pos, l, line_start, column_start);
+    ptrdiff_t l = lexer->src + lexer->pos - start_pos;
+    return make_token(tt, start_pos, (size_t)l, line_start, column_start);
 }
 
 static inline int is_oct(int n) { return n >= '0' && n <= '7'; }
@@ -230,19 +240,19 @@ static Token scan_dec(Lexer *const lexer) {
 
     if (no_zero(peek(lexer))) {
         for (size_t i = 0; isdigit((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer), ++i) {
-            if (i == MAX_LEXEME_LEN) lex_error(lexer, "too long numeric literal"); 
+            if (i == MAX_LEXEME_LEN) lex_error(lexer, "too long numeric literal", lexer->line, lexer->column); 
         }
     } else advance(lexer);
 
     char c = peek(lexer);
 
     if (isalnum((unsigned char) c) || c == '_') {
-        lex_error(lexer, "invalid numeric literal: unexpected characters");
+        lex_error(lexer, "invalid numeric literal: unexpected characters", lexer->line, lexer->column);
         for (; isalnum((unsigned char) peek(lexer)) || peek(lexer) == '_'; advance(lexer));
     }
 
-    size_t l = lexer->src + lexer->pos - start_pos;
-    return make_token(TOK_DEC_LIT, start_pos, l, line_start, column_start);
+    ptrdiff_t l = lexer->src + lexer->pos - start_pos;
+    return make_token(TOK_DEC_LIT, start_pos, (size_t)l, line_start, column_start);
 }
 
 static Token scan_number(Lexer *const lexer) {
@@ -256,44 +266,118 @@ static Token scan_number(Lexer *const lexer) {
 }
 
 static inline void advance_bytes_no_col(Lexer *const lexer, size_t n) { lexer->pos += n; }
-static inline void advance_bytes_col(Lexer *const lexer, size_t n) { lexer->pos += n; lexer->column++; }
+
+static int utf8_handler(Lexer *lexer) {
+    unsigned char b0 = (unsigned char)peek(lexer);
+    
+    int len = (b0 < 0x80) ? 1 :
+              (b0 & 0xE0) == 0xC0 ? 2 :
+              (b0 & 0xF0) == 0xE0 ? 3 :
+              (b0 & 0xF8) == 0xF0 ? 4 : -1;
+
+    if (len == -1 || lexer->length - lexer->pos < (size_t)len) {
+        return -1;
+    }
+
+    for (int i = 1; i < len; i++) {
+        unsigned char bi = (unsigned char)lexer->src[lexer->pos + (size_t)i];
+        if ((bi & 0xC0) != 0x80) {
+            return -1;
+        }
+    }
+    return len;
+}
+
+static void flush_until_quote_or_eol(Lexer *lexer) {
+    while (true) {
+        unsigned char c = (unsigned char)peek(lexer);
+        if (c == '"' || c == '\n' || c == '\0') {
+            if (c == '"') advance(lexer);
+            break;
+        }
+        int len = utf8_handler(lexer);
+        
+        if (len < 1) {
+            len = 1;
+        }
+
+        size_t remain = lexer->length - lexer->pos;
+        if (remain < (size_t)len) {
+            advance_bytes_no_col(lexer, remain);
+            break;
+        } else {
+            advance(lexer);
+            advance_bytes_no_col(lexer, (size_t)(len - 1));
+        }
+    }
+}
 
 static Token scan_string(Lexer *lexer) {
     const char *start_pos = lexer->src + lexer->pos;
     size_t line_start = lexer->line;
     size_t column_start = lexer->column;
+    size_t str_lit_len_bytes = 0;
+
+    char *buf = malloc(MAX_STRING_LITERAL_LEN + 5);
+    if (!buf) { fprintf(stderr, "malloc"); exit(EXIT_FAILURE); }
 
     advance(lexer);
+    
+    while (true) {
+        int len = utf8_handler(lexer);
 
-    for (size_t i = 0;; ++i) {
-        if (i == MAX_STRING_LITERAL_LEN) lex_error(lexer, "too long string literal");
-        unsigned char c = peek(lexer);
-        
-        if ((c & 0xE0) == 0xC0) { advance_bytes_col(lexer, 2); continue; }
-        else if ((c & 0xF0) == 0xE0) { advance_bytes_col(lexer, 3); continue; }
-        else if ((c & 0xF8) == 0xF0) { advance_bytes_col(lexer, 4); continue; }
-        
-        if (c == '"') { advance(lexer); break; }
-        
-        if (c == '\\') {
-            advance(lexer);
-            switch (peek(lexer)) {
-                case 'n': case 't': case 'r': case '"': case '\\': case '0': break;
-                default: lex_error(lexer, "invalid escape sequence in string literal");
+        if (len == 1) {
+            if (peek(lexer) == '"') {
+                advance(lexer);
+                break;
+            } 
+            if (peek(lexer) == '\n' || peek(lexer) == '\0') {
+                lex_error(lexer, "unterminated string literal", lexer->line, lexer->column);
+                break;
+            }            
+            if (peek(lexer) == '\\') {
+                switch (peek_next(lexer)) {
+                    case 'n': buf[str_lit_len_bytes++] = '\n'; break;
+                    case 't': buf[str_lit_len_bytes++] = '\t'; break;
+                    case 'r': buf[str_lit_len_bytes++] = '\r'; break;
+                    case '"': buf[str_lit_len_bytes++] = '"'; break;
+                    case '\\': buf[str_lit_len_bytes++] = '\\'; break;
+                    case '0': buf[str_lit_len_bytes++] = '\0'; break;
+                    default: lex_error(lexer, "invalid escape sequence in string literal", lexer->line, lexer->column);
+                }
+                advance(lexer);
+                if (peek(lexer) != '\n') advance(lexer);
+            } else {
+                buf[str_lit_len_bytes++] = advance(lexer);
             }
+        } else {
+            if (len == -1) {
+                lex_error(lexer, "invalid UTF-8", lexer->line, lexer->column);
+            } else {
+                memcpy(buf + str_lit_len_bytes, lexer->src + lexer->pos, (size_t)len);
+                advance_bytes_no_col(lexer, (size_t)(len - 1));
+                str_lit_len_bytes += (size_t)len;
+            }
+            advance(lexer);
+        }
+        if (str_lit_len_bytes > MAX_STRING_LITERAL_LEN) {
+            lex_error(lexer, "too long string literal", line_start, column_start);
+            flush_until_quote_or_eol(lexer);
+            break;
         }
 
-        c = peek(lexer);
-
-        if (c == '\n' || c == '\0') { lex_error(lexer, "unterminated string literal"); break; }
-        advance(lexer);
     }
+    char *lit = realloc(buf, str_lit_len_bytes + 1);
+    if (!lit) { fprintf(stderr, "realloc"); exit(EXIT_FAILURE); }
+    lit[str_lit_len_bytes] = '\0';
     
-    size_t l = lexer->src + lexer->pos - start_pos;
-    return make_token(TOK_STRING_LIT, start_pos, l, line_start, column_start);
+    ptrdiff_t l = lexer->src + lexer->pos - start_pos;
+    Token str_token = make_token(TOK_STRING_LIT, start_pos, (size_t)l, line_start, column_start);
+    set_str_lit_length_bytes(&str_token, str_lit_len_bytes + 1, lit);
+    return str_token;
 }
 
-void tokenvec_init(TokenVec *v) {
+static void tokenvec_init(TokenVec *v) {
     v->data = malloc(128 * sizeof(Token));
     if (!v->data) {
         fprintf(stderr, "malloc\n");
@@ -303,7 +387,7 @@ void tokenvec_init(TokenVec *v) {
     v->count = 0;
 }
 
-void tokenvec_push(TokenVec *v, Token t) {
+static void tokenvec_push(TokenVec *v, Token t) {
     if (v->count == v->cap) {
         v->cap *= 2;
         v->data = realloc(v->data, v->cap * sizeof(Token));
@@ -315,9 +399,7 @@ void tokenvec_push(TokenVec *v, Token t) {
     v->data[v->count++] = t;
 }
 
-//void tokenvec_free(TokenVec *v); TODO
-
-Token lexer_next(Lexer *const lexer) {
+static Token lexer_next(Lexer *const lexer) {
     skip_ignorable(lexer);
     char c = peek(lexer);
 
@@ -330,84 +412,104 @@ Token lexer_next(Lexer *const lexer) {
     const char *start_pos = lexer->src + lexer->pos;
     size_t line_start = lexer->line;
     size_t column_start = lexer->column;
-    
-    switch (advance(lexer)) {
-        case '(': return make_token(TOK_LPAREN, start_pos, 1, line_start, column_start);
-        case ')': return make_token(TOK_RPAREN, start_pos, 1, line_start, column_start);
-        case '[': return make_token(TOK_LBRACKET, start_pos, 1, line_start, column_start);
-        case ']': return make_token(TOK_RBRACKET, start_pos, 1, line_start, column_start);
-        case '{': return make_token(TOK_LBRACE, start_pos, 1, line_start, column_start);
-        case '}': return make_token(TOK_RBRACE, start_pos, 1, line_start, column_start);
-        case '.': return make_token(TOK_DOT, start_pos, 1, line_start, column_start);
-        case ',': return make_token(TOK_COMMA, start_pos, 1, line_start, column_start);
-        case ':': return make_token(TOK_COLON, start_pos, 1, line_start, column_start);
-        case ';': return make_token(TOK_SEMICOLON, start_pos, 1, line_start, column_start);
-        case '+': return make_token(TOK_PLUS, start_pos, 1, line_start, column_start);
-        case '-': return make_token(TOK_MINUS, start_pos, 1, line_start, column_start);
-        case '*': return make_token(TOK_STAR, start_pos, 1, line_start, column_start);
-        case '/': return make_token(TOK_SLASH, start_pos, 1, line_start, column_start);
-        case '%': return make_token(TOK_PERCENT, start_pos, 1, line_start, column_start);
-        case '=':
-            if (match(lexer, '=')) return make_token(TOK_EQ_EQ, start_pos, 2, line_start, column_start);
-            else return make_token(TOK_EQ, start_pos, 1, line_start, column_start);
-        case '<':
-            if (match(lexer, '=')) return make_token(TOK_LT_EQ, start_pos, 2, line_start, column_start);
-            else return make_token(TOK_LT, start_pos, 1, line_start, column_start);
-        case '>':
-            if (match(lexer, '=')) return make_token(TOK_GT_EQ, start_pos, 2, line_start, column_start);
-            else return make_token(TOK_GT, start_pos, 1, line_start, column_start);
-        case '!':
-            if (match(lexer, '=')) return make_token(TOK_NOT_EQ, start_pos, 2, line_start, column_start);
-            else return make_token(TOK_NOT, start_pos, 1, line_start, column_start);
-        case '&':
-            if (match(lexer, '&')) return make_token(TOK_AMP_AMP, start_pos, 2, line_start, column_start);
-            lex_error(lexer, "unexpected '&'"); 
-            return make_token(TOK_UNKNOWN, start_pos, 1, line_start, column_start);
-        case '|':
-            if (match(lexer, '|')) return make_token(TOK_PIPE_PIPE, start_pos, 2, line_start, column_start);
-            lex_error(lexer, "unexpected '|'");
-            return make_token(TOK_UNKNOWN, start_pos, 1, line_start, column_start);
+    Token t;
+
+    switch (*start_pos) {
+        case '(': t = make_token(TOK_LPAREN, start_pos, 1, line_start, column_start); break;
+        case ')': t = make_token(TOK_RPAREN, start_pos, 1, line_start, column_start); break;
+        case '[': t = make_token(TOK_LBRACKET, start_pos, 1, line_start, column_start); break;
+        case ']': t = make_token(TOK_RBRACKET, start_pos, 1, line_start, column_start); break;
+        case '{': t = make_token(TOK_LBRACE, start_pos, 1, line_start, column_start); break;
+        case '}': t = make_token(TOK_RBRACE, start_pos, 1, line_start, column_start); break;
+        case '.': t = make_token(TOK_DOT, start_pos, 1, line_start, column_start); break;
+        case ',': t = make_token(TOK_COMMA, start_pos, 1, line_start, column_start); break;
+        case ':': t = make_token(TOK_COLON, start_pos, 1, line_start, column_start); break;
+        case ';': t = make_token(TOK_SEMICOLON, start_pos, 1, line_start, column_start); break;
+        case '+': t = make_token(TOK_PLUS, start_pos, 1, line_start, column_start); break;
+        case '-': t = make_token(TOK_MINUS, start_pos, 1, line_start, column_start); break;
+        case '*': t = make_token(TOK_STAR, start_pos, 1, line_start, column_start); break;
+        case '/': t = make_token(TOK_SLASH, start_pos, 1, line_start, column_start); break;
+        case '%': t = make_token(TOK_PERCENT, start_pos, 1, line_start, column_start); break;
+        case '=':{
+            if (peek_next(lexer) == '=') {
+                t = make_token(TOK_EQ_EQ, start_pos, 2, line_start, column_start);
+                advance(lexer);
+            } else {
+                t = make_token(TOK_EQ, start_pos, 1, line_start, column_start);
+            }
+            break;
+        }
+        case '<':{
+            if (peek_next(lexer) == '=') {
+                t = make_token(TOK_LT_EQ, start_pos, 2, line_start, column_start);
+                advance(lexer);
+            } else {
+                t = make_token(TOK_LT, start_pos, 1, line_start, column_start);
+            }
+            break;
+        }
+        case '>':{
+            if (peek_next(lexer) == '=') {
+                t = make_token(TOK_GT_EQ, start_pos, 2, line_start, column_start);
+                advance(lexer);
+            }
+            else {
+                t = make_token(TOK_GT, start_pos, 1, line_start, column_start);
+            }
+            break;
+        }
+        case '!':{
+            if (peek_next(lexer) == '=') {
+                t = make_token(TOK_NOT_EQ, start_pos, 2, line_start, column_start);
+                advance(lexer);
+            } else {
+                t = make_token(TOK_NOT, start_pos, 1, line_start, column_start);
+            }
+            break;
+        }
+        case '&':{
+            if (peek_next(lexer) == '&') {
+                t = make_token(TOK_AMP_AMP, start_pos, 2, line_start, column_start);
+                advance(lexer);
+            } else {
+                lex_error(lexer, "unexpected '&'", line_start, column_start);
+                t = make_token(TOK_UNKNOWN, start_pos, 1, line_start, column_start);
+            }
+            break;
+        }
+        case '|':{
+            if (peek_next(lexer) == '|') {
+                t = make_token(TOK_PIPE_PIPE, start_pos, 2, line_start, column_start);
+                advance(lexer);
+            } else {
+                lex_error(lexer, "unexpected '|'", line_start, column_start);
+                t = make_token(TOK_UNKNOWN, start_pos, 1, line_start, column_start);
+            }
+            break;
+        }
         default: {
-            const unsigned char *start = (const unsigned char *)start_pos;
-            unsigned char b0 = start[0];
-
-            if (b0 < 0x80) {
-                lex_error(lexer, "unexpected character");
-                return make_token(TOK_UNKNOWN, (const char *)start, 1, line_start, column_start);
+            if (lexer->utf8_error) break;
+            
+            lexer->utf8_error = true;
+            int len = utf8_handler(lexer);
+            if (len == 1) {
+                lex_error(lexer, "unexpected character", line_start, column_start);
+                t = make_token(TOK_UNKNOWN, start_pos, 1, line_start, column_start);
+            } else if (len == -1) {
+                lex_error(lexer, "invalid UTF-8", line_start, column_start);
+                t = make_token(TOK_UNKNOWN, start_pos, 1, line_start, column_start);
+            } else {
+                lex_error(lexer, "non-ASCII character not allowed out of a string literal", line_start, column_start);
+                advance_bytes_no_col(lexer, (size_t)(len - 1));
+                t = make_token(TOK_UNKNOWN, start_pos, (size_t)len, line_start, column_start);
             }
-
-            int len = (b0 & 0xE0) == 0xC0 ? 2 :
-                      (b0 & 0xF0) == 0xE0 ? 3 :
-                      (b0 & 0xF8) == 0xF0 ? 4 : -1;
-
-            if (len < 0) {
-                lex_error(lexer, "invalid UTF-8");
-                return make_token(TOK_UNKNOWN, (const char*)start, 1, line_start, column_start);
-            }
-
-            size_t remain = lexer->length - lexer->pos;
-            if (remain < (size_t)(len - 1)) {
-                lex_error(lexer, "invalid UTF-8");
-                return make_token(TOK_UNKNOWN, (const char*)start, 1, line_start, column_start);
-            }
-
-            for (int i = 0; i < len - 1; i++) {
-                unsigned char bi = (unsigned char)lexer->src[lexer->pos + i];
-                if ((bi & 0xC0) != 0x80) {
-                    lex_error(lexer, "invalid UTF-8");
-                    return make_token(TOK_UNKNOWN, (const char*)start, 1, line_start, column_start);
-                }
-            }
-
-            advance_bytes_no_col(lexer, (size_t)(len - 1));
-
-            lex_error(lexer, "non-ASCII character not allowed");
-            return make_token(TOK_UNKNOWN, (const char*)start, (size_t)len, line_start, column_start);
         }
     }
+    advance(lexer);
+    return t;
 }
 
-void lexer_init(Lexer *const lex, const char *s, size_t len, const char *path) {
+static void lexer_init(Lexer *const lex, const char *s, size_t len, const char *path) {
     lex->src = s;
     lex->path = path;
     lex->length = len;
@@ -418,12 +520,7 @@ void lexer_init(Lexer *const lex, const char *s, size_t len, const char *path) {
     lex->err_count = 0;
     lex->err_cap = 0;
     lex->had_error = false;
-}
-
-void dump_lex_errors(const Lexer *const lex) {
-    for (size_t i = 0; i < lex->err_count; i++) {
-        printf("%s:%zu:%zu: lexical error: %s\n", lex->path, lex->errors[i].line, lex->errors[i].column, lex->errors[i].msg);
-    }
+    lex->utf8_error = false;
 }
 
 TokenVec lexer_all(const char *path) {
@@ -435,15 +532,11 @@ TokenVec lexer_all(const char *path) {
     tokenvec_init(&vec);
 
     for (size_t i = 0;; ++i) {
-        if (i == MAX_TOKEN_AMOUNT) { lex_error(&lexer, "too many tokens"); break; }
+        if (i == MAX_TOKEN_AMOUNT) { lex_error(&lexer, "too many tokens", lexer.line, lexer.column); break; }
         Token tok = lexer_next(&lexer);
         tokenvec_push(&vec, tok);
-        //printf("type:%20s  lexeme:%30.*s  line:%5zu  column:%5zu\n",
-          //     token_type_name(tok.type), (int)tok.length, tok.start_pos,
-            //   tok.line, tok.column);
         if (tok.type == TOK_EOF) break;
     }
-    
     if (lexer.had_error) { dump_lex_errors(&lexer); exit(EXIT_FAILURE); }
     return vec;
 }
